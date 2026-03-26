@@ -10,6 +10,11 @@
 # container recreation. Environment variables are written to $HERMES_HOME/.env
 # and read by hermes at startup — no container recreation needed for env changes.
 #
+# Tool resolution: the hermes wrapper uses --suffix PATH for nix store tools,
+# so apt-installed versions in /usr/bin take priority. The container entrypoint
+# apt-installs extensible tools (nodejs, npm, uv) on first boot, giving agents
+# writable tool prefixes for npm i -g, uv tool install, etc.
+#
 # Usage:
 #   services.hermes-agent = {
 #     enable = true;
