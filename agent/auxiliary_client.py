@@ -1308,6 +1308,13 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
             resolved_provider = "custom"
             explicit_base_url = runtime_base_url
             explicit_api_key = runtime_api_key or None
+        elif runtime_base_url and main_provider == "gemini":
+            # Preserve explicit Gemini endpoint selection from the live runtime.
+            # If the main agent is intentionally pinned to Google's OpenAI-
+            # compatible route (or another explicit Gemini endpoint), auxiliary
+            # tasks must honor that instead of silently switching transports.
+            explicit_base_url = runtime_base_url
+            explicit_api_key = runtime_api_key or None
         client, resolved = resolve_provider_client(
             resolved_provider,
             main_model,
@@ -1640,7 +1647,7 @@ def resolve_provider_client(
             return (_to_async_client(client, final_model) if async_mode else (client, final_model))
 
         creds = resolve_api_key_provider_credentials(provider)
-        api_key = str(creds.get("api_key", "")).strip()
+        api_key = str((explicit_api_key or "")).strip() or str(creds.get("api_key", "")).strip()
         if not api_key:
             tried_sources = list(pconfig.api_key_env_vars)
             if provider == "copilot":
@@ -1650,9 +1657,8 @@ def resolve_provider_client(
                          provider, ", ".join(tried_sources))
             return None, None
 
-        base_url = _to_openai_base_url(
-            str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-        )
+        configured_base = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        base_url = _to_openai_base_url((explicit_base_url or configured_base).strip().rstrip("/"))
 
         default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
         final_model = _normalize_resolved_model(model or default_model, provider)

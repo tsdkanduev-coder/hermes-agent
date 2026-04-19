@@ -909,6 +909,24 @@ class TestStaleBaseUrlWarning:
         assert not any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
             "Should NOT warn when OPENAI_BASE_URL is not set"
 
+    def test_gemini_main_runtime_preserves_explicit_base_url(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_API_KEY", "AIza_ENV")
+        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_native, \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock(base_url="https://generativelanguage.googleapis.com/v1beta/openai")
+            client, model = _resolve_auto(main_runtime={
+                "provider": "gemini",
+                "model": "gemini-2.5-flash",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "api_key": "AIza_RUNTIME",
+                "api_mode": "chat_completions",
+            })
+
+        mock_native.assert_not_called()
+        mock_openai.assert_called_once()
+        assert model == "gemini-2.5-flash"
+        assert str(getattr(client, "base_url", "")) == "https://generativelanguage.googleapis.com/v1beta/openai"
+
 # ---------------------------------------------------------------------------
 # Anthropic-compatible image block conversion
 # ---------------------------------------------------------------------------

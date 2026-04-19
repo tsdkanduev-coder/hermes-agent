@@ -186,6 +186,20 @@ def test_native_http_error_keeps_status_and_retry_after():
     assert "quota exhausted" in str(err)
 
 
+def test_iter_sse_events_supports_multiline_data_frames():
+    from agent.gemini_native_adapter import _iter_sse_events
+
+    class DummyStreamResponse:
+        def iter_text(self):
+            yield 'data: {"candidates":\n'
+            yield 'data: [{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}]}\n\n'
+            yield 'data: [DONE]\n\n'
+
+    events = list(_iter_sse_events(DummyStreamResponse()))
+    assert len(events) == 1
+    assert events[0]["candidates"][0]["content"]["parts"][0]["text"] == "hello"
+
+
 def test_native_client_accepts_injected_http_client():
     from agent.gemini_native_adapter import GeminiNativeClient
 

@@ -38,6 +38,20 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Google Gemini (OAuth)** | `hermes model` → "Google Gemini (OAuth)" (provider: `google-gemini-cli`, free tier supported, browser PKCE login) |
 | **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
 
+:::info Google AI Studio transport
+The built-in `gemini` provider now uses Google's native Gemini API (`https://generativelanguage.googleapis.com/v1beta`) by default.
+
+If you specifically want Google's OpenAI-compatible route instead, set an explicit base URL:
+
+```yaml
+model:
+  provider: gemini
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai
+```
+
+That explicit `base_url` is preserved and Hermes will stay on the OpenAI-compatible transport for both the main runtime and auxiliary tasks.
+:::
+
 :::tip Model key alias
 In the `model:` config section, you can use either `default:` or `model:` as the key name for your model ID. Both `model: { default: my-model }` and `model: { model: my-model }` work identically.
 :::

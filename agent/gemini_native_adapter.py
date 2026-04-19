@@ -499,6 +499,25 @@ def _make_stream_chunk(
 
 def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
     buffer = ""
+    data_lines: List[str] = []
+
+    def _flush_event() -> Iterator[Dict[str, Any]]:
+        nonlocal data_lines
+        if not data_lines:
+            return iter(())
+        data = "\n".join(data_lines)
+        data_lines = []
+        if data == "[DONE]":
+            return iter(({"__done__": True},))
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            logger.debug("Non-JSON Gemini SSE event: %s", data[:200])
+            return iter(())
+        if isinstance(payload, dict):
+            return iter((payload,))
+        return iter(())
+
     for chunk in response.iter_text():
         if not chunk:
             continue
@@ -506,20 +525,24 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.rstrip("\r")
-            if not line:
+            if line == "":
+                for payload in _flush_event():
+                    if payload.get("__done__"):
+                        return
+                    yield payload
                 continue
-            if not line.startswith("data: "):
+            if line.startswith(":"):
                 continue
-            data = line[6:]
-            if data == "[DONE]":
-                return
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
-                logger.debug("Non-JSON Gemini SSE line: %s", data[:200])
-                continue
-            if isinstance(payload, dict):
-                yield payload
+            if line.startswith("data:"):
+                value = line[5:]
+                if value.startswith(" "):
+                    value = value[1:]
+                data_lines.append(value)
+
+    for payload in _flush_event():
+        if payload.get("__done__"):
+            return
+        yield payload
 
 
 def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices: Dict[str, Dict[str, Any]]) -> List[_GeminiStreamChunk]:
