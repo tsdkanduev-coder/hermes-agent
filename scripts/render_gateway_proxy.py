@@ -16,6 +16,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +28,13 @@ PUBLIC_PORT = int(os.environ.get("PORT", "10000"))
 INTERNAL_PORT = int(os.environ.get("HERMES_INTERNAL_TELEGRAM_PORT", "8443"))
 HEALTH_HOST = os.environ.get("HERMES_INTERNAL_HOST", "127.0.0.1")
 RENDER_PROXY_HOST = os.environ.get("RENDER_PROXY_HOST", "0.0.0.0")
-GATEWAY_COMMAND = os.environ.get("RENDER_GATEWAY_COMMAND", "hermes gateway run")
+
+
+def _gateway_command() -> list[str]:
+    explicit = os.environ.get("RENDER_GATEWAY_COMMAND", "").strip()
+    if explicit:
+        return shlex.split(explicit)
+    return [sys.executable, "-m", "hermes_cli.main", "gateway", "run"]
 
 
 def _webhook_path() -> str:
@@ -154,7 +161,7 @@ def _terminate_gateway(proc: subprocess.Popen[bytes], reason: str) -> int:
 
 def main() -> int:
     webhook_path = _webhook_path()
-    command = shlex.split(GATEWAY_COMMAND)
+    command = _gateway_command()
 
     print(f"[render-proxy] Starting gateway command: {' '.join(command)}", flush=True)
     gateway_proc = subprocess.Popen(command, env=_build_gateway_env())
