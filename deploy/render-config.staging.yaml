@@ -5,6 +5,9 @@ model:
 
 timezone: Europe/Moscow
 
+web:
+  backend: firecrawl
+
 display:
   tool_progress: new
 
