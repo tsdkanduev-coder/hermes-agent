@@ -155,6 +155,12 @@ TOOLSETS = {
         "tools": ["text_to_speech"],
         "includes": []
     },
+
+    "voice_call": {
+        "description": "Outbound phone calls for concierge tasks such as reservations and availability checks",
+        "tools": ["voice_call"],
+        "includes": []
+    },
     
     "todo": {
         "description": "Task planning and tracking for multi-step work",
