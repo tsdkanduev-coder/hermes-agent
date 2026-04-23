@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import os
+from pathlib import Path
+import re
 import shlex
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 from typing import Optional
@@ -26,6 +30,9 @@ HEALTH_HOST = os.environ.get("HERMES_INTERNAL_HOST", "127.0.0.1")
 RENDER_PROXY_HOST = os.environ.get("RENDER_PROXY_HOST", "0.0.0.0")
 VOICE_CONTROL_PORT = int(os.environ.get("VOICE_CALL_CONTROL_PORT", "3335"))
 VOICE_CONTROL_HOST = os.environ.get("VOICE_CALL_CONTROL_HOST", "127.0.0.1")
+TRACE_ADMIN_TOKEN_ENV = "TRACE_ADMIN_TOKEN"
+TRACE_SEARCH_PATH = "/admin/trace-search"
+MAX_TRACE_TEXT_CHARS = 4000
 
 
 def _python_executable() -> str:
@@ -62,6 +69,63 @@ def _build_gateway_env() -> dict[str, str]:
     env["TELEGRAM_WEBHOOK_PORT"] = str(INTERNAL_PORT)
     env["VOICE_CALL_CONTROL_URL"] = f"http://{VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}/voice"
     return env
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _truncate(value: object, limit: int = MAX_TRACE_TEXT_CHARS) -> object:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... <truncated {len(text) - limit} chars>"
+
+
+def _redact(value: object) -> object:
+    if value is None:
+        return None
+    text = str(value)
+    patterns = [
+        (r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]"),
+        (r"\b\d{8,}:[A-Za-z0-9_-]{20,}\b", "[TELEGRAM_TOKEN_REDACTED]"),
+        (r"\brnd_[A-Za-z0-9_-]{16,}\b", "rnd_[REDACTED]"),
+        (r"\bfc-[A-Za-z0-9_-]{16,}\b", "fc-[REDACTED]"),
+        (r"\bsk-[A-Za-z0-9_-]{16,}\b", "sk-[REDACTED]"),
+        (r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s,}]+", r"\1=[REDACTED]"),
+    ]
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return _truncate(text)
+
+
+def _parse_log_timestamp(line: str) -> Optional[float]:
+    # Hermes file logs start with "YYYY-mm-dd HH:MM:SS,mmm".
+    raw = line[:23]
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S,%f").timestamp()
+    except Exception:
+        return None
+
+
+def _iter_log_files() -> list[Path]:
+    log_dir = _hermes_home() / "logs"
+    names = [
+        "agent.log",
+        "agent.log.1",
+        "agent.log.2",
+        "agent.log.3",
+        "gateway.log",
+        "gateway.log.1",
+        "gateway.log.2",
+        "gateway.log.3",
+        "errors.log",
+        "errors.log.1",
+        "errors.log.2",
+    ]
+    return [log_dir / name for name in names if (log_dir / name).exists()]
 
 
 def _port_is_open(host: str, port: int) -> bool:
@@ -103,6 +167,190 @@ class RenderProxy:
         payload = self.health_payload()
         status = 200 if payload["status"] == "ok" else 503
         return web.json_response(payload, status=status)
+
+    def _admin_authorized(self, request: web.Request) -> bool:
+        expected = os.environ.get(TRACE_ADMIN_TOKEN_ENV, "").strip()
+        if not expected:
+            return False
+        auth = request.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip() == expected
+        return request.headers.get("X-Trace-Token", "").strip() == expected
+
+    async def trace_search(self, request: web.Request) -> web.Response:
+        if not self._admin_authorized(request):
+            return web.json_response({"detail": "Not found"}, status=404)
+
+        query = request.query.get("q", "").strip()
+        if not query:
+            return web.json_response({"detail": "q is required"}, status=400)
+
+        try:
+            limit = min(max(int(request.query.get("limit", "5")), 1), 20)
+        except ValueError:
+            limit = 5
+        try:
+            window_seconds = min(max(int(request.query.get("window_seconds", "900")), 60), 7200)
+        except ValueError:
+            window_seconds = 900
+
+        db_path = _hermes_home() / "state.db"
+        if not db_path.exists():
+            return web.json_response(
+                {"detail": "state.db not found", "path": str(db_path)}, status=404
+            )
+
+        payload: dict[str, object] = {
+            "query": query,
+            "db_path": str(db_path),
+            "matches": [],
+        }
+
+        like = f"%{query.lower()}%"
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT m.id, m.session_id, m.role, m.content, m.tool_call_id,
+                       m.tool_calls, m.tool_name, m.timestamp, s.source, s.user_id,
+                       s.model, s.started_at
+                FROM messages m
+                LEFT JOIN sessions s ON s.id = m.session_id
+                WHERE lower(coalesce(m.content, '')) LIKE ?
+                   OR lower(coalesce(m.tool_calls, '')) LIKE ?
+                ORDER BY m.timestamp DESC, m.id DESC
+                LIMIT ?
+                """,
+                (like, like, limit),
+            ).fetchall()
+
+            matches = []
+            for row in rows:
+                start_ts = float(row["timestamp"] or 0) - window_seconds
+                end_ts = float(row["timestamp"] or 0) + window_seconds
+                context_rows = conn.execute(
+                    """
+                    SELECT id, role, content, tool_call_id, tool_calls, tool_name,
+                           timestamp, finish_reason
+                    FROM messages
+                    WHERE session_id = ?
+                      AND timestamp BETWEEN ? AND ?
+                    ORDER BY timestamp ASC, id ASC
+                    LIMIT 80
+                    """,
+                    (row["session_id"], start_ts, end_ts),
+                ).fetchall()
+
+                messages = []
+                tool_name_by_call_id: dict[str, str] = {}
+                for msg in context_rows:
+                    tool_calls = None
+                    if msg["tool_calls"]:
+                        try:
+                            tool_calls = json.loads(msg["tool_calls"])
+                            for tc in tool_calls if isinstance(tool_calls, list) else []:
+                                call_id = tc.get("id") or tc.get("tool_call_id")
+                                name = (tc.get("function") or {}).get("name") or tc.get("name")
+                                if call_id and name:
+                                    tool_name_by_call_id[str(call_id)] = str(name)
+                        except Exception:
+                            tool_calls = _redact(msg["tool_calls"])
+                    inferred_tool_name = msg["tool_name"]
+                    if not inferred_tool_name and msg["tool_call_id"]:
+                        inferred_tool_name = tool_name_by_call_id.get(str(msg["tool_call_id"]))
+                    messages.append(
+                        {
+                            "id": msg["id"],
+                            "role": msg["role"],
+                            "timestamp": msg["timestamp"],
+                            "tool_name": inferred_tool_name,
+                            "tool_call_id": msg["tool_call_id"],
+                            "tool_calls": tool_calls,
+                            "finish_reason": msg["finish_reason"],
+                            "content": _redact(msg["content"]),
+                        }
+                    )
+
+                log_lines = self._collect_trace_logs(
+                    session_id=str(row["session_id"]),
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    query=query,
+                    max_lines=300,
+                )
+
+                matches.append(
+                    {
+                        "message_id": row["id"],
+                        "session_id": row["session_id"],
+                        "source": row["source"],
+                        "user_id": row["user_id"],
+                        "model": row["model"],
+                        "matched_role": row["role"],
+                        "matched_timestamp": row["timestamp"],
+                        "matched_content": _redact(row["content"]),
+                        "messages": messages,
+                        "logs": log_lines,
+                    }
+                )
+
+            payload["matches"] = matches
+            return web.json_response(payload)
+        finally:
+            conn.close()
+
+    def _collect_trace_logs(
+        self,
+        *,
+        session_id: str,
+        start_ts: float,
+        end_ts: float,
+        query: str,
+        max_lines: int,
+    ) -> list[dict[str, object]]:
+        query_lower = query.lower()
+        keep_markers = (
+            "conversation turn:",
+            "api call #",
+            "tool ",
+            "turn ended:",
+            "response ready:",
+            "web_search",
+            "web_extract",
+            "todo",
+        )
+        collected: list[dict[str, object]] = []
+        for path in _iter_log_files():
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        line = line.rstrip("\n")
+                        lower = line.lower()
+                        ts = _parse_log_timestamp(line)
+                        in_window = ts is None or (start_ts <= ts <= end_ts)
+                        relevant = (
+                            session_id in line
+                            or query_lower in lower
+                            or any(marker in lower for marker in keep_markers)
+                        )
+                        if in_window and relevant:
+                            collected.append(
+                                {
+                                    "file": path.name,
+                                    "timestamp": ts,
+                                    "line": _redact(line),
+                                }
+                            )
+            except Exception as exc:
+                collected.append(
+                    {
+                        "file": path.name,
+                        "timestamp": None,
+                        "line": f"[trace_search] failed to read log file: {exc}",
+                    }
+                )
+        return collected[-max_lines:]
 
     async def proxy_telegram(self, request: web.Request) -> web.StreamResponse:
         if request.path != self.webhook_path:
@@ -168,6 +416,7 @@ async def _main_async() -> int:
     public_app = web.Application(client_max_size=2 * 1024 * 1024)
     public_app.router.add_get("/", proxy.health)
     public_app.router.add_get("/health", proxy.health)
+    public_app.router.add_get(TRACE_SEARCH_PATH, proxy.trace_search)
     public_app.router.add_route("*", webhook_path, proxy.proxy_telegram)
     public_app.router.add_post(proxy.voice.webhook_path, proxy.voice.handle_webhook)
     public_app.router.add_get(proxy.voice.stream_path, proxy.voice.handle_stream)
