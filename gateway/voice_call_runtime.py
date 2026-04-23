@@ -16,6 +16,7 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import os
 import time
 import uuid
@@ -33,14 +34,19 @@ except Exception:  # pragma: no cover - dependency exists in Render all extra
     jwt = None
 
 
+logger = logging.getLogger(__name__)
+
+
 CALL_ENDED_EVENTS = {
     "call.ended",
     "call.completed",
     "call.failed",
+    "call.error",
     "call.hangup",
     "ended",
     "completed",
     "failed",
+    "error",
     "hangup",
     "disconnected",
     "timeout",
@@ -83,6 +89,13 @@ def _get_hermes_home() -> Path:
 
 def _truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mask_phone(value: str) -> str:
+    clean = str(value or "").strip()
+    if len(clean) <= 4:
+        return "***"
+    return f"***{clean[-4:]}"
 
 
 def _public_origin() -> str:
@@ -136,6 +149,7 @@ class VoiceCallRuntime:
             "webhook_path": self.webhook_path,
             "stream_path": self.stream_path,
             "active_calls": len([c for c in self.calls.values() if not c.ended_at]),
+            "warnings": self.config_warnings(),
         }
 
     def missing_requirements(self) -> list[str]:
@@ -162,6 +176,14 @@ class VoiceCallRuntime:
             missing.append("VOXIMPLANT_MANAGEMENT_JWT or service account fields")
         return missing
 
+    def config_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        if not os.environ.get("VOICE_CALL_FROM_NUMBER", "").strip():
+            warnings.append(
+                "VOICE_CALL_FROM_NUMBER is not set; Voximplant scenario must provide a caller ID fallback."
+            )
+        return warnings
+
     # ------------------------------------------------------------------
     # Internal control API used by the Hermes tool
     # ------------------------------------------------------------------
@@ -180,6 +202,17 @@ class VoiceCallRuntime:
                 {"success": False, "error": "voice_call not configured", "missing": missing},
                 status=503,
             )
+        from_number = str(data.get("from") or os.environ.get("VOICE_CALL_FROM_NUMBER", "")).strip()
+        if not from_number:
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "voice_call not configured",
+                    "missing": ["VOICE_CALL_FROM_NUMBER"],
+                    "detail": "Outbound Voximplant calls require a configured caller ID.",
+                },
+                status=503,
+            )
 
         call = CallRecord(
             call_id=f"call_{uuid.uuid4().hex[:16]}",
@@ -189,12 +222,19 @@ class VoiceCallRuntime:
             chat_id=str(data.get("chat_id") or ""),
             session_key=str(data.get("session_key") or ""),
             language=str(data.get("language") or "ru"),
-            from_number=str(data.get("from") or os.environ.get("VOICE_CALL_FROM_NUMBER", "")),
+            from_number=from_number,
             stream_token=uuid.uuid4().hex,
         )
         self.calls[call.call_id] = call
         self.calls_by_token[call.stream_token] = call.call_id
         self._persist(call)
+        logger.info(
+            "voice_call initiate call_id=%s to=%s from_set=%s user_id=%s",
+            call.call_id,
+            _mask_phone(call.to),
+            bool(call.from_number),
+            call.user_id,
+        )
 
         try:
             await self._start_voximplant_call(call)
@@ -203,6 +243,7 @@ class VoiceCallRuntime:
             call.error = str(exc)
             call.touch()
             self._persist(call)
+            logger.exception("voice_call start failed call_id=%s", call.call_id)
             return web.json_response({"success": False, "error": str(exc)}, status=502)
 
         return web.json_response(
@@ -257,6 +298,11 @@ class VoiceCallRuntime:
 
         call = self._call_from_payload(payload, request)
         if not call:
+            logger.info(
+                "voice_call webhook ignored event=%s payload_keys=%s",
+                self._event_type(payload),
+                sorted(payload.keys()),
+            )
             return web.json_response({"ok": True, "ignored": True})
 
         event_type = self._event_type(payload)
@@ -282,6 +328,14 @@ class VoiceCallRuntime:
         call.status = event_type or call.status
         call.touch()
         self._persist(call)
+        logger.info(
+            "voice_call webhook call_id=%s provider_call_id=%s event=%s control_url_set=%s transcript_items=%s",
+            call.call_id,
+            call.provider_call_id,
+            event_type or "unknown",
+            bool(call.control_url),
+            len(call.transcript),
+        )
 
         if event_type in CALL_ENDED_EVENTS or "end" in event_type or "hangup" in event_type:
             asyncio.create_task(self._finalize_call(call, event_type or "ended"))
@@ -293,6 +347,7 @@ class VoiceCallRuntime:
         call_id = self.calls_by_token.get(token)
         call = self.calls.get(call_id or "")
         if not call:
+            logger.warning("voice_call stream rejected unknown token")
             return web.Response(status=401, text="Unknown stream token")
 
         vox_ws = web.WebSocketResponse(heartbeat=25)
@@ -312,6 +367,7 @@ class VoiceCallRuntime:
         call.status = "streaming"
         call.touch()
         self._persist(call)
+        logger.info("voice_call stream connected call_id=%s", call.call_id)
 
         stream_sid = f"vox-{call.call_id}"
         seq = 0
@@ -367,6 +423,7 @@ class VoiceCallRuntime:
             await realtime.close()
             call.touch()
             self._persist(call)
+            logger.info("voice_call stream closed call_id=%s", call.call_id)
         return vox_ws
 
     async def _send_audio_to_vox(
@@ -416,6 +473,13 @@ class VoiceCallRuntime:
                 "sessionKey": call.session_key,
             },
         }
+        logger.info(
+            "voice_call StartScenarios call_id=%s rule_id=%s to=%s from_set=%s",
+            call.call_id,
+            os.environ["VOXIMPLANT_RULE_ID"],
+            _mask_phone(call.to),
+            bool(call.from_number),
+        )
         response = await self._voximplant_api(
             "StartScenarios",
             {
@@ -445,6 +509,12 @@ class VoiceCallRuntime:
         self.calls_by_provider[call.provider_call_id] = call.call_id
         call.touch()
         self._persist(call)
+        logger.info(
+            "voice_call initiated call_id=%s provider_call_id=%s control_url_set=%s",
+            call.call_id,
+            call.provider_call_id,
+            bool(call.control_url),
+        )
 
     async def _voximplant_api(self, action: str, params: dict[str, str]) -> dict[str, Any]:
         token = await self._management_jwt()
@@ -542,6 +612,11 @@ class VoiceCallRuntime:
             f"{item.get('role', 'unknown')}: {item.get('text', '')}" for item in call.transcript[-80:]
         ).strip()
         if not transcript:
+            if "error" in call.status or "fail" in call.status:
+                return (
+                    "Звонок не состоялся: соединение завершилось ошибкой на стороне телефонии. "
+                    "Бронь не подтверждена."
+                )
             return (
                 "Звонок завершён, но подробная расшифровка не пришла от голосового канала. "
                 "Если нужно, могу попробовать ещё раз."
