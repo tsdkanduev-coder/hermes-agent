@@ -498,6 +498,44 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _coerce_config_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+    return bool(value)
+
+
+def _home_channel_prompt_enabled(platform: "Platform") -> bool:
+    """Return whether first-message home-channel onboarding should be shown."""
+    env_override = os.getenv("HERMES_PROMPT_FOR_HOME_CHANNEL")
+    if env_override is not None:
+        return _coerce_config_bool(env_override, True)
+
+    cfg = _load_gateway_config()
+    enabled = True
+
+    gateway_cfg = cfg.get("gateway")
+    if isinstance(gateway_cfg, dict) and "prompt_for_home_channel" in gateway_cfg:
+        enabled = _coerce_config_bool(gateway_cfg.get("prompt_for_home_channel"), enabled)
+
+    platform_key = _platform_config_key(platform)
+    platform_cfg = (cfg.get("platforms") or {}).get(platform_key)
+    if isinstance(platform_cfg, dict):
+        extra_cfg = platform_cfg.get("extra")
+        if isinstance(extra_cfg, dict) and "prompt_for_home_channel" in extra_cfg:
+            enabled = _coerce_config_bool(extra_cfg.get("prompt_for_home_channel"), enabled)
+
+    return enabled
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -4408,7 +4446,13 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and _home_channel_prompt_enabled(source.platform)
+        ):
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
             if not os.getenv(env_key):

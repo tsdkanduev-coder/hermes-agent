@@ -21,6 +21,7 @@ platforms:
     reply_to_mode: first
     extra:
       disable_link_previews: true
+      prompt_for_home_channel: false
 
 group_sessions_per_user: true
 thread_sessions_per_user: false
