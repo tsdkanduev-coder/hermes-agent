@@ -1577,9 +1577,17 @@ class GatewayRunner:
             thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = (
+                    "Принял сообщение. Отвечу сразу после завершения текущего обновления."
+                    if event.source.platform == Platform.TELEGRAM
+                    else f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                )
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = (
+                    "Сейчас идет техническое обновление. Пожалуйста, повторите сообщение через минуту."
+                    if event.source.platform == Platform.TELEGRAM
+                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                )
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -1625,7 +1633,9 @@ class GatewayRunner:
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment
+        # Build a status-rich acknowledgment for logs/debugging.  User-facing
+        # Telegram copy must stay concierge-safe and never expose iterations,
+        # tool names, or gateway internals.
         status_parts = []
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
@@ -1646,9 +1656,13 @@ class GatewayRunner:
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        if status_detail:
+            logger.info("Busy-session interrupt ack for %s%s", session_key[:20], status_detail)
+
         message = (
-            f"⚡ Interrupting current task{status_detail}. "
-            f"I'll respond to your message shortly."
+            "Принял новое сообщение. Сейчас отвечу по нему."
+            if event.source.platform == Platform.TELEGRAM
+            else "Got your new message. Switching to it now."
         )
 
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
