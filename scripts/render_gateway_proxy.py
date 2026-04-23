@@ -30,11 +30,31 @@ HEALTH_HOST = os.environ.get("HERMES_INTERNAL_HOST", "127.0.0.1")
 RENDER_PROXY_HOST = os.environ.get("RENDER_PROXY_HOST", "0.0.0.0")
 
 
+def _python_executable() -> str:
+    candidates = []
+    virtual_env = os.environ.get("VIRTUAL_ENV", "").strip()
+    if virtual_env:
+        candidates.append(os.path.join(virtual_env, "bin", "python"))
+
+    candidates.extend(
+        [
+            "/opt/hermes/.venv/bin/python",
+            sys.executable,
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    return sys.executable
+
+
 def _gateway_command() -> list[str]:
     explicit = os.environ.get("RENDER_GATEWAY_COMMAND", "").strip()
     if explicit:
         return shlex.split(explicit)
-    return [sys.executable, "-m", "hermes_cli.main", "gateway", "run"]
+    return [_python_executable(), "-m", "hermes_cli.main", "gateway", "run"]
 
 
 def _webhook_path() -> str:

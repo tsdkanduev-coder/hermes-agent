@@ -17,4 +17,9 @@ cp "$SOURCE_CONFIG" "$HERMES_HOME/config.yaml"
 cp "$SOURCE_SOUL" "$HERMES_HOME/SOUL.md"
 touch "$BOOTSTRAP_MARKER"
 
-exec python3 scripts/render_gateway_proxy.py
+PYTHON_BIN="${VIRTUAL_ENV:-/opt/hermes/.venv}/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+exec "$PYTHON_BIN" scripts/render_gateway_proxy.py
