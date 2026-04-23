@@ -1,0 +1,21 @@
+timezone: Europe/Moscow
+
+display:
+  tool_progress: new
+
+approvals:
+  mode: manual
+  timeout: 60
+
+platform_toolsets:
+  cli: [hermes-cli]
+  telegram: [safe, todo]
+
+platforms:
+  telegram:
+    reply_to_mode: first
+    extra:
+      disable_link_previews: true
+
+group_sessions_per_user: true
+thread_sessions_per_user: false

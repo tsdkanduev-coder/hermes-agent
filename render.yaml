@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: giga-hermes-staging
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: ./scripts/render-gateway-start.sh
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+    disk:
+      name: giga-hermes-data
+      mountPath: /opt/data
+      sizeGB: 1
