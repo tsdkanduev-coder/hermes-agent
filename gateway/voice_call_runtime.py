@@ -78,6 +78,7 @@ class CallRecord:
     ended_at: float | None = None
     transcript: list[dict[str, str]] = field(default_factory=list)
     summary_sent: bool = False
+    summary_suppressed: bool = False
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -595,17 +596,50 @@ class VoiceCallRuntime:
     # ------------------------------------------------------------------
 
     async def _finalize_call(self, call: CallRecord, reason: str) -> None:
-        if call.summary_sent:
+        if call.summary_sent or call.summary_suppressed:
             return
         call.status = reason
         call.ended_at = call.ended_at or time.time()
-        call.summary_sent = True
         call.touch()
         self._persist(call)
-        if not call.chat_id:
+        if not self._should_send_completion_summary(call):
+            call.summary_suppressed = True
+            call.touch()
+            self._persist(call)
+            logger.info(
+                "voice_call async summary suppressed call_id=%s status=%s transcript_items=%s elapsed=%.1fs",
+                call.call_id,
+                call.status,
+                len(call.transcript),
+                (call.ended_at or time.time()) - call.created_at,
+            )
             return
         text = await self._build_summary(call)
         await self._send_telegram(call.chat_id, text)
+        call.summary_sent = True
+        call.touch()
+        self._persist(call)
+
+    def _should_send_completion_summary(self, call: CallRecord) -> bool:
+        if not call.chat_id:
+            return False
+        if _truthy(os.environ.get("VOICE_CALL_DISABLE_ASYNC_SUMMARY")):
+            return False
+        if _truthy(os.environ.get("VOICE_CALL_NOTIFY_FAST_FAILURES")):
+            return True
+        status = str(call.status or "").lower()
+        is_failure = any(
+            marker in status
+            for marker in ("error", "fail", "busy", "no_answer", "no-answer", "timeout", "cancel")
+        )
+        if not is_failure or call.transcript:
+            return True
+        try:
+            suppress_seconds = float(os.environ.get("VOICE_CALL_SUPPRESS_FAST_FAILURE_SECONDS", "30"))
+        except ValueError:
+            suppress_seconds = 30.0
+        elapsed = (call.ended_at or time.time()) - call.created_at
+        return elapsed > suppress_seconds
 
     async def _build_summary(self, call: CallRecord) -> str:
         transcript = "\n".join(
