@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""Render public-port wrapper for Hermes Telegram webhook deployments.
-
-This wrapper avoids optional HTTP dependencies so it can run in minimal
-environments. It binds Render's public ``$PORT``, exposes ``/health``, starts
-``hermes gateway run`` as a child process, and proxies the Telegram webhook
-path to the child gateway's internal webhook listener.
-"""
+"""Render public-port wrapper for Telegram + voice-call deployments."""
 
 from __future__ import annotations
 
-import http.client
+import asyncio
 import json
 import os
 import shlex
@@ -17,17 +11,21 @@ import signal
 import socket
 import subprocess
 import sys
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import urlparse
+
+import aiohttp
+from aiohttp import web
+
+from gateway.voice_call_runtime import VoiceCallRuntime
 
 
 PUBLIC_PORT = int(os.environ.get("PORT", "10000"))
 INTERNAL_PORT = int(os.environ.get("HERMES_INTERNAL_TELEGRAM_PORT", "8443"))
 HEALTH_HOST = os.environ.get("HERMES_INTERNAL_HOST", "127.0.0.1")
 RENDER_PROXY_HOST = os.environ.get("RENDER_PROXY_HOST", "0.0.0.0")
+VOICE_CONTROL_PORT = int(os.environ.get("VOICE_CALL_CONTROL_PORT", "3335"))
+VOICE_CONTROL_HOST = os.environ.get("VOICE_CALL_CONTROL_HOST", "127.0.0.1")
 
 
 def _python_executable() -> str:
@@ -36,17 +34,11 @@ def _python_executable() -> str:
     if virtual_env:
         candidates.append(os.path.join(virtual_env, "bin", "python"))
 
-    candidates.extend(
-        [
-            "/opt/hermes/.venv/bin/python",
-            sys.executable,
-        ]
-    )
+    candidates.extend(["/opt/hermes/.venv/bin/python", sys.executable])
 
     for candidate in candidates:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-
     return sys.executable
 
 
@@ -68,6 +60,7 @@ def _webhook_path() -> str:
 def _build_gateway_env() -> dict[str, str]:
     env = dict(os.environ)
     env["TELEGRAM_WEBHOOK_PORT"] = str(INTERNAL_PORT)
+    env["VOICE_CALL_CONTROL_URL"] = f"http://{VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}/voice"
     return env
 
 
@@ -79,89 +72,66 @@ def _port_is_open(host: str, port: int) -> bool:
         return False
 
 
-class ProxyState:
+class RenderProxy:
     def __init__(self, gateway_proc: subprocess.Popen[bytes], webhook_path: str):
         self.gateway_proc = gateway_proc
         self.webhook_path = webhook_path
+        self.voice = VoiceCallRuntime()
+        self.client = aiohttp.ClientSession()
 
     def gateway_ready(self) -> bool:
         return self.gateway_proc.poll() is None and _port_is_open(HEALTH_HOST, INTERNAL_PORT)
 
     def health_payload(self) -> dict[str, object]:
+        gateway_returncode = self.gateway_proc.poll()
+        gateway_ok = self.gateway_ready()
+        voice_health = self.voice.health()
         return {
-            "status": "ok" if self.gateway_ready() else "starting",
-            "gateway_running": self.gateway_proc.poll() is None,
-            "gateway_returncode": self.gateway_proc.poll(),
+            "status": "ok" if gateway_ok else "starting",
+            "gateway_running": gateway_returncode is None,
+            "gateway_returncode": gateway_returncode,
             "public_port": PUBLIC_PORT,
             "internal_port": INTERNAL_PORT,
             "webhook_path": self.webhook_path,
+            "voice": voice_health,
         }
 
+    async def close(self) -> None:
+        await self.client.close()
 
-class RenderProxyHandler(BaseHTTPRequestHandler):
-    state: ProxyState
+    async def health(self, _request: web.Request) -> web.Response:
+        payload = self.health_payload()
+        status = 200 if payload["status"] == "ok" else 503
+        return web.json_response(payload, status=status)
 
-    def log_message(self, fmt: str, *args: object) -> None:
-        print(f"[render-proxy] {self.address_string()} - {fmt % args}", flush=True)
+    async def proxy_telegram(self, request: web.Request) -> web.StreamResponse:
+        if request.path != self.webhook_path:
+            return web.json_response({"detail": "Not found"}, status=404)
+        if not self.gateway_ready():
+            return web.json_response(
+                {"status": "starting", "detail": "Gateway is not ready yet."}, status=503
+            )
 
-    def _write_json(self, status: int, payload: dict[str, object]) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _path_without_query(self) -> str:
-        return self.path.split("?", 1)[0]
-
-    def _handle_health(self) -> None:
-        payload = self.state.health_payload()
-        self._write_json(200 if payload["status"] == "ok" else 503, payload)
-
-    def _handle_proxy(self) -> None:
-        if self._path_without_query() != self.state.webhook_path:
-            self._write_json(404, {"detail": "Not found"})
-            return
-
-        if not self.state.gateway_ready():
-            self._write_json(503, {"status": "starting", "detail": "Gateway is not ready yet."})
-            return
-
-        content_length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(content_length) if content_length else b""
+        body = await request.read()
         headers = {
             key: value
-            for key, value in self.headers.items()
+            for key, value in request.headers.items()
             if key.lower() not in {"host", "content-length", "connection"}
         }
-
-        connection = http.client.HTTPConnection(HEALTH_HOST, INTERNAL_PORT, timeout=30)
-        try:
-            connection.request(self.command, self.path, body=body, headers=headers)
-            response = connection.getresponse()
-            payload = response.read()
-            self.send_response(response.status)
-            content_type = response.getheader("Content-Type")
+        target = f"http://{HEALTH_HOST}:{INTERNAL_PORT}{request.rel_url}"
+        async with self.client.request(
+            request.method,
+            target,
+            data=body,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=35),
+        ) as response:
+            payload = await response.read()
+            outgoing = web.Response(status=response.status, body=payload)
+            content_type = response.headers.get("Content-Type")
             if content_type:
-                self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-        finally:
-            connection.close()
-
-    def do_GET(self) -> None:
-        if self._path_without_query() in {"/", "/health"}:
-            self._handle_health()
-            return
-        self._handle_proxy()
-
-    def do_POST(self) -> None:
-        self._handle_proxy()
-
-    def do_PUT(self) -> None:
-        self._handle_proxy()
+                outgoing.headers["Content-Type"] = content_type
+            return outgoing
 
 
 def _terminate_gateway(proc: subprocess.Popen[bytes], reason: str) -> int:
@@ -179,37 +149,55 @@ def _terminate_gateway(proc: subprocess.Popen[bytes], reason: str) -> int:
     return proc.returncode or 0
 
 
-def main() -> int:
+async def _start_site(app: web.Application, host: str, port: int) -> web.AppRunner:
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    return runner
+
+
+async def _main_async() -> int:
     webhook_path = _webhook_path()
     command = _gateway_command()
 
     print(f"[render-proxy] Starting gateway command: {' '.join(command)}", flush=True)
     gateway_proc = subprocess.Popen(command, env=_build_gateway_env())
-    state = ProxyState(gateway_proc, webhook_path)
-    RenderProxyHandler.state = state
+    proxy = RenderProxy(gateway_proc, webhook_path)
 
-    server = ThreadingHTTPServer((RENDER_PROXY_HOST, PUBLIC_PORT), RenderProxyHandler)
-    server.daemon_threads = True
+    public_app = web.Application(client_max_size=2 * 1024 * 1024)
+    public_app.router.add_get("/", proxy.health)
+    public_app.router.add_get("/health", proxy.health)
+    public_app.router.add_route("*", webhook_path, proxy.proxy_telegram)
+    public_app.router.add_post(proxy.voice.webhook_path, proxy.voice.handle_webhook)
+    public_app.router.add_get(proxy.voice.stream_path, proxy.voice.handle_stream)
+
+    control_app = web.Application(client_max_size=2 * 1024 * 1024)
+    control_app.router.add_post("/voice/calls", proxy.voice.handle_control_initiate)
+    control_app.router.add_get("/voice/calls", proxy.voice.handle_control_history)
+    control_app.router.add_get("/voice/calls/{call_id}", proxy.voice.handle_control_status)
+    control_app.router.add_post("/voice/calls/{call_id}/end", proxy.voice.handle_control_end)
+
+    public_runner = await _start_site(public_app, RENDER_PROXY_HOST, PUBLIC_PORT)
+    control_runner = await _start_site(control_app, VOICE_CONTROL_HOST, VOICE_CONTROL_PORT)
 
     print(
-        f"[render-proxy] Listening on {RENDER_PROXY_HOST}:{PUBLIC_PORT} "
-        f"and proxying {webhook_path} -> {HEALTH_HOST}:{INTERNAL_PORT}{webhook_path}",
+        f"[render-proxy] Listening on {RENDER_PROXY_HOST}:{PUBLIC_PORT}; "
+        f"Telegram {webhook_path} -> {HEALTH_HOST}:{INTERNAL_PORT}{webhook_path}; "
+        f"voice webhook {proxy.voice.webhook_path}; voice stream {proxy.voice.stream_path}; "
+        f"voice control {VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}",
         flush=True,
     )
 
-    stop_event = threading.Event()
+    stop_event = asyncio.Event()
 
     def _request_stop(sig_num: int, _frame: Optional[object]) -> None:
         sig_name = signal.Signals(sig_num).name
         print(f"[render-proxy] Received {sig_name}", flush=True)
         stop_event.set()
-        server.shutdown()
 
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
-
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
 
     returncode = 0
     try:
@@ -219,16 +207,20 @@ def main() -> int:
                 returncode = current
                 print(f"[render-proxy] Gateway exited with code {returncode}", flush=True)
                 stop_event.set()
-                server.shutdown()
                 break
-            time.sleep(1)
+            await asyncio.sleep(1)
     finally:
         if gateway_proc.poll() is None:
             returncode = _terminate_gateway(gateway_proc, "signal")
-        server.server_close()
-        server_thread.join(timeout=5)
+        await proxy.close()
+        await control_runner.cleanup()
+        await public_runner.cleanup()
 
     return returncode
+
+
+def main() -> int:
+    return asyncio.run(_main_async())
 
 
 if __name__ == "__main__":

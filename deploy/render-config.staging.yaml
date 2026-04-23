@@ -9,7 +9,7 @@ web:
   backend: firecrawl
 
 display:
-  tool_progress: new
+  tool_progress: off
 
 approvals:
   mode: manual
@@ -17,7 +17,7 @@ approvals:
 
 platform_toolsets:
   cli: [hermes-cli]
-  telegram: [safe, todo]
+  telegram: [safe, todo, voice_call]
 
 platforms:
   telegram:
