@@ -25,7 +25,7 @@ approvals:
 
 platform_toolsets:
   cli: [hermes-cli]
-  telegram: [safe, todo, cronjob, voice_call]
+  telegram: [safe, todo, cronjob, voice_call, calendar]
 
 platforms:
   telegram:

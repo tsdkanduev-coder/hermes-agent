@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
+from gateway.google_calendar_runtime import GoogleCalendarRuntime, delayed_cleanup_pending
 from gateway.voice_call_runtime import VoiceCallRuntime
 
 
@@ -68,6 +69,9 @@ def _build_gateway_env() -> dict[str, str]:
     env = dict(os.environ)
     env["TELEGRAM_WEBHOOK_PORT"] = str(INTERNAL_PORT)
     env["VOICE_CALL_CONTROL_URL"] = f"http://{VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}/voice"
+    env["GOOGLE_CALENDAR_CONTROL_URL"] = (
+        f"http://{VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}/calendar"
+    )
     return env
 
 
@@ -141,6 +145,7 @@ class RenderProxy:
         self.gateway_proc = gateway_proc
         self.webhook_path = webhook_path
         self.voice = VoiceCallRuntime()
+        self.calendar = GoogleCalendarRuntime()
         self.client = aiohttp.ClientSession()
 
     def gateway_ready(self) -> bool:
@@ -158,6 +163,7 @@ class RenderProxy:
             "internal_port": INTERNAL_PORT,
             "webhook_path": self.webhook_path,
             "voice": voice_health,
+            "calendar": self.calendar.health(),
         }
 
     async def close(self) -> None:
@@ -420,21 +426,29 @@ async def _main_async() -> int:
     public_app.router.add_route("*", webhook_path, proxy.proxy_telegram)
     public_app.router.add_post(proxy.voice.webhook_path, proxy.voice.handle_webhook)
     public_app.router.add_get(proxy.voice.stream_path, proxy.voice.handle_stream)
+    public_app.router.add_get(proxy.calendar.callback_path, proxy.calendar.handle_public_callback)
 
     control_app = web.Application(client_max_size=2 * 1024 * 1024)
     control_app.router.add_post("/voice/calls", proxy.voice.handle_control_initiate)
     control_app.router.add_get("/voice/calls", proxy.voice.handle_control_history)
     control_app.router.add_get("/voice/calls/{call_id}", proxy.voice.handle_control_status)
     control_app.router.add_post("/voice/calls/{call_id}/end", proxy.voice.handle_control_end)
+    control_app.router.add_post("/calendar/connect", proxy.calendar.handle_control_connect)
+    control_app.router.add_get("/calendar/status", proxy.calendar.handle_control_status)
+    control_app.router.add_post("/calendar/disconnect", proxy.calendar.handle_control_disconnect)
+    control_app.router.add_post("/calendar/events", proxy.calendar.handle_control_list)
+    control_app.router.add_post("/calendar/free-slots", proxy.calendar.handle_control_find_slots)
 
     public_runner = await _start_site(public_app, RENDER_PROXY_HOST, PUBLIC_PORT)
     control_runner = await _start_site(control_app, VOICE_CONTROL_HOST, VOICE_CONTROL_PORT)
+    calendar_cleanup_task = asyncio.create_task(delayed_cleanup_pending(proxy.calendar))
 
     print(
         f"[render-proxy] Listening on {RENDER_PROXY_HOST}:{PUBLIC_PORT}; "
         f"Telegram {webhook_path} -> {HEALTH_HOST}:{INTERNAL_PORT}{webhook_path}; "
         f"voice webhook {proxy.voice.webhook_path}; voice stream {proxy.voice.stream_path}; "
-        f"voice control {VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}",
+        f"voice/calendar control {VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}; "
+        f"calendar callback {proxy.calendar.callback_path}",
         flush=True,
     )
 
@@ -461,6 +475,11 @@ async def _main_async() -> int:
     finally:
         if gateway_proc.poll() is None:
             returncode = _terminate_gateway(gateway_proc, "signal")
+        calendar_cleanup_task.cancel()
+        try:
+            await calendar_cleanup_task
+        except asyncio.CancelledError:
+            pass
         await proxy.close()
         await control_runner.cleanup()
         await public_runner.cleanup()

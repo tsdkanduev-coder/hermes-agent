@@ -161,6 +161,12 @@ TOOLSETS = {
         "tools": ["voice_call"],
         "includes": []
     },
+
+    "calendar": {
+        "description": "Google Calendar OAuth and read-only schedule tools",
+        "tools": ["calendar"],
+        "includes": []
+    },
     
     "todo": {
         "description": "Task planning and tracking for multi-step work",
