@@ -5,6 +5,9 @@ model:
 
 timezone: Europe/Moscow
 
+cron:
+  wrap_response: false
+
 web:
   backend: firecrawl
 
