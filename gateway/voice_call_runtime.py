@@ -22,9 +22,11 @@ import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiohttp import web, WSMsgType
@@ -56,6 +58,36 @@ CALL_ENDED_EVENTS = {
     "no-answer",
     "cancelled",
     "canceled",
+}
+
+CALENDAR_LINK_POSITIVE_RE = re.compile(
+    r"(забронировал|забронирован[ао]?|бронь подтвержден[а]?|успешно заброниров|"
+    r"ресторан подтвердил|подтвердил.*брон)",
+    re.IGNORECASE,
+)
+CALENDAR_LINK_NEGATIVE_RE = re.compile(
+    r"(не удалось|не подтвержден|нет подтверждения|не состоялся|не смог|не дозвони|"
+    r"мест нет|к сожалению|отказ|ошибк)",
+    re.IGNORECASE,
+)
+WEEKDAY_ALIASES = {
+    "понедельник": 0,
+    "понедельника": 0,
+    "вторник": 1,
+    "вторника": 1,
+    "среда": 2,
+    "среду": 2,
+    "среды": 2,
+    "четверг": 3,
+    "четверга": 3,
+    "пятница": 4,
+    "пятницу": 4,
+    "пятницы": 4,
+    "суббота": 5,
+    "субботу": 5,
+    "субботы": 5,
+    "воскресенье": 6,
+    "воскресенья": 6,
 }
 
 
@@ -746,7 +778,7 @@ class VoiceCallRuntime:
                         .strip()
                     )
                     if content:
-                        return content
+                        return self._append_calendar_template_link(content, call)
         except Exception:
             pass
         return f"Звонок завершён. Краткая расшифровка:\n{transcript[:2500]}"
@@ -758,7 +790,11 @@ class VoiceCallRuntime:
         async with aiohttp.ClientSession() as session:
             await session.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text[:3900], "disable_web_page_preview": True},
+                json={
+                    "chat_id": chat_id,
+                    "text": text[:3900],
+                    "disable_web_page_preview": "calendar.google.com/calendar/render" not in text,
+                },
                 timeout=aiohttp.ClientTimeout(total=20),
             )
 
@@ -783,6 +819,143 @@ class VoiceCallRuntime:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _append_calendar_template_link(self, text: str, call: CallRecord) -> str:
+        if "calendar.google.com/calendar/render" in text:
+            return text
+        if not CALENDAR_LINK_POSITIVE_RE.search(text) or CALENDAR_LINK_NEGATIVE_RE.search(text):
+            return text
+        event_start = self._infer_calendar_start(text, call)
+        if not event_start:
+            return text
+        try:
+            duration_min = int(os.environ.get("VOICE_CALL_CALENDAR_LINK_DURATION_MIN", "120"))
+        except ValueError:
+            duration_min = 120
+        event_end = event_start + timedelta(minutes=max(duration_min, 15))
+        title = self._calendar_event_title(call)
+        location = self._calendar_event_location(call)
+        link = self._google_calendar_template_url(
+            title=title,
+            start=event_start,
+            end=event_end,
+            details=text.strip(),
+            location=location,
+        )
+        return f"{text.rstrip()}\n\n📅 Добавить в календарь: {link}"
+
+    def _infer_calendar_start(self, text: str, call: CallRecord) -> datetime | None:
+        tz_name = os.environ.get("TZ") or "Europe/Moscow"
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("Europe/Moscow")
+        combined = f"{text}\n{call.task}"
+        base = datetime.fromtimestamp(call.created_at, tz)
+        date_value = self._infer_calendar_date(combined, base)
+        time_value = self._infer_calendar_time(combined)
+        if not date_value or not time_value:
+            return None
+        return datetime.combine(date_value, time_value, tzinfo=tz)
+
+    @staticmethod
+    def _infer_calendar_date(text: str, base: datetime):
+        iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+        if iso_match:
+            try:
+                return datetime(
+                    int(iso_match.group(1)),
+                    int(iso_match.group(2)),
+                    int(iso_match.group(3)),
+                ).date()
+            except ValueError:
+                return None
+        dotted_match = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b", text)
+        if dotted_match:
+            day = int(dotted_match.group(1))
+            month = int(dotted_match.group(2))
+            year = int(dotted_match.group(3) or base.year)
+            if year < 100:
+                year += 2000
+            try:
+                return datetime(year, month, day).date()
+            except ValueError:
+                return None
+        lowered = text.lower()
+        if "послезавтра" in lowered:
+            return (base + timedelta(days=2)).date()
+        if "завтра" in lowered:
+            return (base + timedelta(days=1)).date()
+        if "сегодня" in lowered:
+            return base.date()
+        for word, weekday in WEEKDAY_ALIASES.items():
+            if re.search(rf"\b{re.escape(word)}\b", lowered):
+                days_ahead = (weekday - base.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                return (base + timedelta(days=days_ahead)).date()
+        return None
+
+    @staticmethod
+    def _infer_calendar_time(text: str):
+        detail_match = re.search(
+            r"(?:Время|время)\s*[:—-]\s*(?:после\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)",
+            text,
+        )
+        if detail_match:
+            return datetime.min.time().replace(
+                hour=int(detail_match.group(1)),
+                minute=int(detail_match.group(2)),
+            )
+        time_match = re.search(r"\b(?:в|на|после)\s+([01]?\d|2[0-3])[:.]([0-5]\d)\b", text, re.IGNORECASE)
+        if time_match:
+            return datetime.min.time().replace(hour=int(time_match.group(1)), minute=int(time_match.group(2)))
+        hour_match = re.search(r"\b(?:в|на|после)\s+([01]?\d|2[0-3])\b", text, re.IGNORECASE)
+        if hour_match:
+            return datetime.min.time().replace(hour=int(hour_match.group(1)), minute=0)
+        return None
+
+    @staticmethod
+    def _calendar_event_title(call: CallRecord) -> str:
+        location = VoiceCallRuntime._calendar_event_location(call)
+        return f"Бронь: {location}" if location else "Бронирование"
+
+    @staticmethod
+    def _calendar_event_location(call: CallRecord) -> str:
+        match = re.search(
+            r"\b(?:в|во)\s+(?:ресторане?\s+|кафе\s+|баре\s+)?"
+            r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9 '&«»\".-]{1,60})"
+            r"(?=\s+(?:на|завтра|сегодня|послезавтра|в\s+\d|после|для|по номеру)|[,.]|$)",
+            call.task,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        candidate = match.group(1).strip(" «»\"'")
+        if re.search(r"\b(завтра|сегодня|послезавтра|имя|человек|персон)\b", candidate, re.IGNORECASE):
+            return ""
+        return candidate[:80]
+
+    @staticmethod
+    def _google_calendar_template_url(
+        *,
+        title: str,
+        start: datetime,
+        end: datetime,
+        details: str,
+        location: str,
+    ) -> str:
+        tz_name = start.tzinfo.key if isinstance(start.tzinfo, ZoneInfo) else (os.environ.get("TZ") or "Europe/Moscow")
+        params = {
+            "action": "TEMPLATE",
+            "text": title,
+            "dates": f"{start.strftime('%Y%m%dT%H%M%S')}/{end.strftime('%Y%m%dT%H%M%S')}",
+            "ctz": tz_name,
+            "details": f"Добавлено из Гига Помощника.\n\n{details}",
+        }
+        if location:
+            params["location"] = location
+        return f"https://calendar.google.com/calendar/render?{urlencode(params)}"
 
     def _resolve_call(self, call_id: str) -> CallRecord | None:
         return self.calls.get(call_id) or self.calls.get(self.calls_by_provider.get(call_id, ""))
