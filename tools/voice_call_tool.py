@@ -209,7 +209,7 @@ registry.register(
         "VOICE_CALL_CONTROL_URL",
         "VOXIMPLANT_RULE_ID",
         "VOXIMPLANT_WEBHOOK_SECRET",
-        "OPENAI_API_KEY",
+        "OPENAI_API_KEY or XAI_API_KEY",
         "TELEGRAM_BOT_TOKEN",
     ],
     emoji="",

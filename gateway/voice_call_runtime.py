@@ -7,7 +7,7 @@ the whole plugin system:
 - Voximplant is started through Management API ``StartScenarios``.
 - VoxEngine sends lifecycle callbacks to ``/voice/webhook``.
 - VoxEngine bridges call audio to ``/voice/stream`` over WebSocket.
-- OpenAI Realtime handles the live speech-to-speech conversation.
+- A realtime voice provider handles the live speech-to-speech conversation.
 """
 
 from __future__ import annotations
@@ -147,6 +147,29 @@ def _read_private_key() -> str:
         return ""
 
 
+def _voice_realtime_provider() -> str:
+    raw = os.environ.get("VOICE_CALL_REALTIME_PROVIDER", "openai").strip().lower()
+    if raw in {"xai", "x-ai", "x.ai", "grok"}:
+        return "xai"
+    return "openai"
+
+
+def _voice_realtime_api_key(provider: str) -> str:
+    if provider == "xai":
+        return os.environ.get("XAI_API_KEY", "").strip()
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def _voice_realtime_model(provider: str) -> str:
+    default = "grok-voice-think-fast-1.0" if provider == "xai" else "gpt-realtime"
+    return os.environ.get("VOICE_CALL_REALTIME_MODEL", default).strip() or default
+
+
+def _voice_realtime_voice(provider: str) -> str:
+    default = "ara" if provider == "xai" else "alloy"
+    return os.environ.get("VOICE_CALL_ASSISTANT_VOICE", default).strip() or default
+
+
 class VoiceCallRuntime:
     def __init__(self) -> None:
         self.calls: dict[str, CallRecord] = {}
@@ -160,9 +183,12 @@ class VoiceCallRuntime:
 
     def health(self) -> dict[str, Any]:
         required = self.missing_requirements()
+        realtime_provider = _voice_realtime_provider()
         return {
             "enabled": not required,
             "missing": required,
+            "realtime_provider": realtime_provider,
+            "realtime_model": _voice_realtime_model(realtime_provider),
             "public_origin": self.public_origin,
             "webhook_path": self.webhook_path,
             "stream_path": self.stream_path,
@@ -172,8 +198,9 @@ class VoiceCallRuntime:
 
     def missing_requirements(self) -> list[str]:
         missing: list[str] = []
-        if not os.environ.get("OPENAI_API_KEY", "").strip():
-            missing.append("OPENAI_API_KEY")
+        provider = _voice_realtime_provider()
+        if not _voice_realtime_api_key(provider):
+            missing.append("XAI_API_KEY" if provider == "xai" else "OPENAI_API_KEY")
         if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
             missing.append("TELEGRAM_BOT_TOKEN")
         if not os.environ.get("VOXIMPLANT_RULE_ID", "").strip():
@@ -371,10 +398,12 @@ class VoiceCallRuntime:
         vox_ws = web.WebSocketResponse(heartbeat=25)
         await vox_ws.prepare(request)
 
-        realtime = OpenAIRealtimeBridge(
-            api_key=os.environ["OPENAI_API_KEY"],
-            model=os.environ.get("VOICE_CALL_REALTIME_MODEL", "gpt-realtime"),
-            voice=os.environ.get("VOICE_CALL_ASSISTANT_VOICE", "alloy"),
+        realtime_provider = _voice_realtime_provider()
+        realtime = RealtimeVoiceBridge(
+            provider=realtime_provider,
+            api_key=_voice_realtime_api_key(realtime_provider),
+            model=_voice_realtime_model(realtime_provider),
+            voice=_voice_realtime_voice(realtime_provider),
             instructions=self._build_voice_instructions(call),
             language=call.language or "ru",
             call=call,
@@ -385,7 +414,12 @@ class VoiceCallRuntime:
         call.status = "streaming"
         call.touch()
         self._persist(call)
-        logger.info("voice_call stream connected call_id=%s", call.call_id)
+        logger.info(
+            "voice_call stream connected call_id=%s realtime_provider=%s model=%s",
+            call.call_id,
+            realtime_provider,
+            realtime.model,
+        )
 
         stream_sid = f"vox-{call.call_id}"
         seq = 0
@@ -836,10 +870,11 @@ class VoiceCallRuntime:
         return ""
 
 
-class OpenAIRealtimeBridge:
+class RealtimeVoiceBridge:
     def __init__(
         self,
         *,
+        provider: str,
         api_key: str,
         model: str,
         voice: str,
@@ -849,6 +884,7 @@ class OpenAIRealtimeBridge:
         on_assistant_audio,
         on_transcript,
     ) -> None:
+        self.provider = provider
         self.api_key = api_key
         self.model = model
         self.voice = voice
@@ -864,6 +900,14 @@ class OpenAIRealtimeBridge:
 
     async def connect(self) -> None:
         self.session = aiohttp.ClientSession()
+        if self.provider == "xai":
+            await self._connect_xai()
+        else:
+            await self._connect_openai()
+        self.reader_task = asyncio.create_task(self._read_events())
+
+    async def _connect_openai(self) -> None:
+        assert self.session is not None
         self.ws = await self.session.ws_connect(
             f"wss://api.openai.com/v1/realtime?model={self.model}",
             headers={"Authorization": f"Bearer {self.api_key}", "OpenAI-Beta": "realtime=v1"},
@@ -891,7 +935,41 @@ class OpenAIRealtimeBridge:
                 },
             }
         )
-        self.reader_task = asyncio.create_task(self._read_events())
+
+    async def _connect_xai(self) -> None:
+        assert self.session is not None
+        base_url = os.environ.get("XAI_REALTIME_URL", "wss://api.x.ai/v1/realtime").strip()
+        separator = "&" if "?" in base_url else "?"
+        self.ws = await self.session.ws_connect(
+            f"{base_url}{separator}model={self.model}",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            heartbeat=20,
+        )
+        await self.ws.send_json(
+            {
+                "type": "session.update",
+                "session": {
+                    "instructions": self.instructions,
+                    "voice": self.voice,
+                    "audio": {
+                        "input": {
+                            "format": {
+                                "type": os.environ.get("VOICE_CALL_XAI_INPUT_FORMAT", "audio/pcmu"),
+                            }
+                        },
+                        "output": {
+                            "format": {
+                                "type": os.environ.get("VOICE_CALL_XAI_OUTPUT_FORMAT", "audio/pcmu"),
+                            },
+                        },
+                    },
+                    "turn_detection": {
+                        "type": os.environ.get("VOICE_CALL_XAI_TURN_DETECTION", "server_vad"),
+                        "create_response": True,
+                    },
+                },
+            }
+        )
 
     async def send_audio(self, audio: bytes) -> None:
         if self.ws and not self.ws.closed and audio:
@@ -924,24 +1002,40 @@ class OpenAIRealtimeBridge:
             except json.JSONDecodeError:
                 continue
             event_type = str(event.get("type") or "")
-            if event_type == "response.audio.delta":
+            if event_type in {"response.audio.delta", "response.output_audio.delta"}:
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     await self.on_assistant_audio(base64.b64decode(delta))
                 continue
-            if event_type in {"response.audio_transcript.delta", "response.output_text.delta"}:
+            if event_type in {
+                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
+                "response.output_text.delta",
+                "response.text.delta",
+            }:
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     self._assistant_text += delta
                 continue
-            if event_type in {"response.audio_transcript.done", "response.output_text.done"}:
+            if event_type in {
+                "response.audio_transcript.done",
+                "response.output_audio_transcript.done",
+                "response.output_text.done",
+                "response.text.done",
+            }:
                 text = str(event.get("transcript") or event.get("text") or self._assistant_text).strip()
                 self._assistant_text = ""
                 if text:
                     self.on_transcript("assistant", text)
                 continue
-            if event_type == "conversation.item.input_audio_transcription.completed":
+            if event_type in {
+                "conversation.item.input_audio_transcription.completed",
+                "conversation.item.input_audio_transcription.done",
+                "input_audio_buffer.transcription.completed",
+            }:
                 text = str(event.get("transcript") or "").strip()
                 if text:
                     self.on_transcript("callee", text)
                 continue
+            if event_type == "error":
+                logger.warning("voice_call realtime error provider=%s event=%s", self.provider, event)

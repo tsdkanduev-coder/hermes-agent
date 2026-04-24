@@ -13,6 +13,9 @@ display:
   technical_notices: off
   busy_ack: off
 
+session_reset:
+  notify: false
+
 approvals:
   mode: manual
   timeout: 60
