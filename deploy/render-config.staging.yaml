@@ -10,6 +10,8 @@ web:
 
 display:
   tool_progress: off
+  technical_notices: off
+  busy_ack: off
 
 approvals:
   mode: manual
@@ -17,7 +19,7 @@ approvals:
 
 platform_toolsets:
   cli: [hermes-cli]
-  telegram: [safe, todo, voice_call]
+  telegram: [safe, todo, cronjob, voice_call]
 
 platforms:
   telegram:

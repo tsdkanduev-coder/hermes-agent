@@ -536,6 +536,25 @@ def _home_channel_prompt_enabled(platform: "Platform") -> bool:
     return enabled
 
 
+def _resolve_gateway_display_setting(platform: "Platform", setting: str, default: object) -> object:
+    """Resolve a display setting for gateway-only user-facing notices."""
+    try:
+        from gateway.display_config import resolve_display_setting
+
+        return resolve_display_setting(
+            _load_gateway_config(),
+            _platform_config_key(platform),
+            setting,
+            default,
+        )
+    except Exception:
+        return default
+
+
+def _gateway_display_bool(platform: "Platform", setting: str, default: bool) -> bool:
+    return _coerce_config_bool(_resolve_gateway_display_setting(platform, setting, default), default)
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -1632,6 +1651,8 @@ class GatewayRunner:
             return True  # interrupt sent, ack already delivered recently
 
         self._busy_ack_ts[session_key] = now
+        if not _gateway_display_bool(event.source.platform, "busy_ack", True):
+            return True
 
         # Build a status-rich acknowledgment for logs/debugging.  User-facing
         # Telegram copy must stay concierge-safe and never expose iterations,
@@ -4128,6 +4149,8 @@ class GatewayRunner:
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
                 )
+                if not _gateway_display_bool(source.platform, "technical_notices", True):
+                    should_notify = False
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
