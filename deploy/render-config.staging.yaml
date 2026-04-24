@@ -33,6 +33,7 @@ platforms:
     extra:
       disable_link_previews: true
       prompt_for_home_channel: false
+      publish_bot_commands: false
 
 group_sessions_per_user: true
 thread_sessions_per_user: false
