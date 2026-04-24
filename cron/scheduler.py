@@ -651,7 +651,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        "REMINDERS: If the task is a simple reminder, do not output a bare "
+        "task label. Write a natural reminder sentence, for example: "
+        "\"Напоминаю, что вы просили попросить кальян.\" or "
+        "\"Напоминаю, что вам сейчас нужно выйти из дома.\"]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
