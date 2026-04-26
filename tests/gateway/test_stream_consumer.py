@@ -85,6 +85,62 @@ class TestCleanForDisplay:
         assert result == text
 
 
+# ── Interim status normalization ─────────────────────────────────────────
+
+
+class TestInterimStatusNormalization:
+    """Telegram concierge UX should not leak model-generated progress chatter."""
+
+    def test_status_replaced_once(self):
+        adapter = MagicMock()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(normalize_interim_status=True),
+        )
+
+        first = consumer._normalize_interim_status_text(
+            "Подбираю конкретные варианты по Фетхие."
+        )
+        second = consumer._normalize_interim_status_text(
+            "Собрал базу, уточняю по условиям."
+        )
+
+        assert first == (
+            "Цевдн, взяли ваш запрос в работу. "
+            "Потребуется несколько минут, подождите, пожалуйста"
+        )
+        assert second == ""
+
+    def test_final_answer_not_replaced(self):
+        adapter = MagicMock()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(normalize_interim_status=True),
+        )
+        text = "Подобрал вам три варианта:\n1. Kidsout — удобен для срочного заказа."
+
+        assert consumer._normalize_interim_status_text(text) == text
+
+    @pytest.mark.asyncio
+    async def test_initial_stream_status_is_not_marked_delivered(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(normalize_interim_status=True),
+        )
+
+        delivered = await consumer._send_or_edit("Подбираю проверяемые варианты. ▉")
+
+        assert delivered is False
+        assert consumer.already_sent is False
+        adapter.send.assert_not_called()
+
+
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
 

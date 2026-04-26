@@ -9187,6 +9187,7 @@ class GatewayRunner:
                         buffer_threshold=_scfg.buffer_threshold,
                         cursor=_effective_cursor,
                         buffer_only=_buffer_only,
+                        normalize_interim_status=(source.platform == Platform.TELEGRAM),
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -9810,6 +9811,7 @@ class GatewayRunner:
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
                             buffer_only=_buffer_only,
+                            normalize_interim_status=(source.platform == Platform.TELEGRAM),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,

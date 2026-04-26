@@ -44,6 +44,11 @@ class StreamConsumerConfig:
     buffer_threshold: int = 40
     cursor: str = " ▉"
     buffer_only: bool = False
+    normalize_interim_status: bool = False
+    long_work_ack_text: str = (
+        "Цевдн, взяли ваш запрос в работу. "
+        "Потребуется несколько минут, подождите, пожалуйста"
+    )
 
 
 class GatewayStreamConsumer:
@@ -108,6 +113,7 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        self._long_work_ack_sent = False
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -263,6 +269,39 @@ class GatewayStreamConsumer:
             self._accumulated += self._think_buffer
             self._think_buffer = ""
 
+    _INTERIM_STATUS_RE = re.compile(
+        r"^\s*(?:"
+        r"подбираю|ищу|проверяю|уточняю|собираю|"
+        r"собрал(?:а)?\s+базу|наш[её]л\s+базу|"
+        r"сейчас\s+(?:найду|проверю|уточню|посмотрю|подберу)|"
+        r"заберу|доберу|смотрю|беру|возьму"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    def _is_interim_status_text(self, text: str) -> bool:
+        """Return True for short process-status bubbles, not final answers."""
+        cleaned = self._clean_for_display(text)
+        if self.cfg.cursor:
+            cleaned = cleaned.replace(self.cfg.cursor, "")
+        stripped = cleaned.strip()
+        if not stripped or len(stripped) > 240:
+            return False
+        if "\n" in stripped or "http://" in stripped or "https://" in stripped:
+            return False
+        if re.search(r"(^|\s)(?:[-*]|\d+[.)])\s+", stripped):
+            return False
+        return bool(self._INTERIM_STATUS_RE.search(stripped))
+
+    def _normalize_interim_status_text(self, text: str) -> str:
+        """Replace repeated model-generated progress chatter with one UX-approved ack."""
+        if not self.cfg.normalize_interim_status or not self._is_interim_status_text(text):
+            return text
+        if self._long_work_ack_sent:
+            return ""
+        self._long_work_ack_sent = True
+        return self.cfg.long_work_ack_text
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
         # Platform message length limit — leave room for cursor + formatting
@@ -314,6 +353,11 @@ class GatewayStreamConsumer:
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
+                    if got_segment_break:
+                        self._accumulated = self._normalize_interim_status_text(self._accumulated)
+                        if not self._accumulated:
+                            self._reset_segment_state(preserve_no_edit=True)
+                            continue
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -716,6 +760,7 @@ class GatewayStreamConsumer:
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
         text = self._clean_for_display(text)
+        text = self._normalize_interim_status_text(text)
         if not text.strip():
             return False
         try:
@@ -748,6 +793,13 @@ class GatewayStreamConsumer:
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
         text = self._clean_for_display(text)
+        if (
+            self.cfg.normalize_interim_status
+            and not finalize
+            and self._message_id is None
+            and self._is_interim_status_text(text)
+        ):
+            return False
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text
