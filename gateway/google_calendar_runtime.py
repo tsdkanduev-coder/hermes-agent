@@ -9,6 +9,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -27,7 +28,16 @@ logger = logging.getLogger(__name__)
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
-DEFAULT_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+GOOGLE_DOCS_DOCUMENT_URL = "https://docs.googleapis.com/v1/documents/{document_id}"
+DEFAULT_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+DEFAULT_WORKSPACE_SCOPES = [
+    DEFAULT_CALENDAR_SCOPE,
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/documents.readonly",
+]
 
 
 def _get_hermes_home() -> Path:
@@ -57,9 +67,13 @@ def _public_origin() -> str:
 
 
 def _scopes() -> list[str]:
-    raw = os.environ.get("GOOGLE_CALENDAR_SCOPES", DEFAULT_SCOPE)
+    raw = (
+        os.environ.get("GOOGLE_WORKSPACE_SCOPES", "").strip()
+        or os.environ.get("GOOGLE_CALENDAR_SCOPES", "").strip()
+        or " ".join(DEFAULT_WORKSPACE_SCOPES)
+    )
     scopes = [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
-    return scopes or [DEFAULT_SCOPE]
+    return scopes or list(DEFAULT_WORKSPACE_SCOPES)
 
 
 def _safe_filename(value: str) -> str:
@@ -105,6 +119,7 @@ class PendingOAuth:
     chat_id: str
     session_key: str = ""
     user_name: str = ""
+    product: str = "calendar"
     created_at: float = field(default_factory=time.time)
 
 
@@ -136,6 +151,22 @@ class GoogleCalendarRuntime:
             "connected_users": len(list(self.users_dir.glob("*.json"))),
         }
 
+    def workspace_health(self) -> dict[str, Any]:
+        scopes = _scopes()
+        return {
+            "enabled": not self.missing_requirements(),
+            "missing": self.missing_requirements(),
+            "callback_path": self.callback_path,
+            "scopes": scopes,
+            "connected_users": len(list(self.users_dir.glob("*.json"))),
+            "capabilities": {
+                "calendar_read": DEFAULT_CALENDAR_SCOPE in scopes,
+                "gmail_read": "https://www.googleapis.com/auth/gmail.readonly" in scopes,
+                "drive_read": "https://www.googleapis.com/auth/drive.readonly" in scopes,
+                "docs_read": "https://www.googleapis.com/auth/documents.readonly" in scopes,
+            },
+        }
+
     def missing_requirements(self) -> list[str]:
         missing: list[str] = []
         if not os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip():
@@ -152,6 +183,14 @@ class GoogleCalendarRuntime:
 
     async def handle_control_connect(self, request: web.Request) -> web.Response:
         data = await request.json()
+        return await self._handle_connect_payload(data)
+
+    async def handle_workspace_control_connect(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        data["product"] = "workspace"
+        return await self._handle_connect_payload(data)
+
+    async def _handle_connect_payload(self, data: dict[str, Any]) -> web.Response:
         user_id = str(data.get("user_id") or "").strip()
         chat_id = str(data.get("chat_id") or "").strip()
         if not user_id or not chat_id:
@@ -180,6 +219,7 @@ class GoogleCalendarRuntime:
             chat_id=chat_id,
             session_key=str(data.get("session_key") or ""),
             user_name=str(data.get("user_name") or ""),
+            product=str(data.get("product") or "calendar"),
         )
         self._write_json(self._pending_path(state), pending.__dict__)
 
@@ -200,11 +240,7 @@ class GoogleCalendarRuntime:
             {
                 "success": True,
                 "auth_url": auth_url,
-                "public_message": (
-                    "Чтобы подключить Google Calendar, откройте ссылку и разрешите доступ:\n"
-                    f"{auth_url}\n\n"
-                    "После подтверждения вернитесь в Telegram — сообщу, когда календарь подключится."
-                ),
+                "public_message": self._connect_public_message(auth_url, pending.product),
             }
         )
 
@@ -220,6 +256,19 @@ class GoogleCalendarRuntime:
             }
         )
 
+    async def handle_workspace_control_status(self, request: web.Request) -> web.Response:
+        user_id = request.query.get("user_id", "").strip()
+        token = self._load_user_token(user_id)
+        return web.json_response(
+            {
+                "success": True,
+                "connected": bool(token),
+                "scopes": (token or {}).get("scope", ""),
+                "updated_at": (token or {}).get("updated_at"),
+                "capabilities": self.workspace_health()["capabilities"],
+            }
+        )
+
     async def handle_control_disconnect(self, request: web.Request) -> web.Response:
         data = await request.json()
         user_id = str(data.get("user_id") or "").strip()
@@ -227,6 +276,75 @@ class GoogleCalendarRuntime:
         if path.exists():
             path.unlink()
         return web.json_response({"success": True, "connected": False})
+
+    async def handle_workspace_gmail_search(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        user_id = str(data.get("user_id") or "").strip()
+        query = str(data.get("query") or "newer_than:7d").strip()
+        max_results = min(max(int(data.get("max_results") or 10), 1), 25)
+        token = await self._valid_access_token(user_id)
+        if not token:
+            return web.json_response(
+                {"success": False, "error": "google workspace is not connected", "connected": False},
+                status=401,
+            )
+        messages = await self._gmail_search(token, query=query, max_results=max_results)
+        return web.json_response(
+            {"success": True, "connected": True, "query": query, "messages": messages}
+        )
+
+    async def handle_workspace_gmail_get(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        user_id = str(data.get("user_id") or "").strip()
+        message_id = str(data.get("message_id") or "").strip()
+        if not message_id:
+            return web.json_response(
+                {"success": False, "error": "message_id is required"},
+                status=400,
+            )
+        token = await self._valid_access_token(user_id)
+        if not token:
+            return web.json_response(
+                {"success": False, "error": "google workspace is not connected", "connected": False},
+                status=401,
+            )
+        message = await self._gmail_get(token, message_id)
+        return web.json_response({"success": True, "connected": True, "message": message})
+
+    async def handle_workspace_docs_search(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        user_id = str(data.get("user_id") or "").strip()
+        query = str(data.get("query") or "").strip()
+        max_results = min(max(int(data.get("max_results") or 10), 1), 25)
+        token = await self._valid_access_token(user_id)
+        if not token:
+            return web.json_response(
+                {"success": False, "error": "google workspace is not connected", "connected": False},
+                status=401,
+            )
+        documents = await self._docs_search(token, query=query, max_results=max_results)
+        return web.json_response(
+            {"success": True, "connected": True, "query": query, "documents": documents}
+        )
+
+    async def handle_workspace_docs_get(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        user_id = str(data.get("user_id") or "").strip()
+        raw_doc_id = str(data.get("doc_id") or data.get("url") or "").strip()
+        doc_id = self._extract_doc_id(raw_doc_id)
+        if not doc_id:
+            return web.json_response(
+                {"success": False, "error": "doc_id or Google Docs URL is required"},
+                status=400,
+            )
+        token = await self._valid_access_token(user_id)
+        if not token:
+            return web.json_response(
+                {"success": False, "error": "google workspace is not connected", "connected": False},
+                status=401,
+            )
+        document = await self._docs_get(token, doc_id)
+        return web.json_response({"success": True, "connected": True, "document": document})
 
     async def handle_control_list(self, request: web.Request) -> web.Response:
         data = await request.json()
@@ -310,7 +428,7 @@ class GoogleCalendarRuntime:
         if error:
             await self._send_telegram(
                 pending.chat_id,
-                "Календарь не подключён: доступ не был подтверждён.",
+                self._oauth_denied_message(pending.product),
             )
             self._pending_path(state).unlink(missing_ok=True)
             return self._html_response("Доступ не подтверждён. Можно закрыть эту вкладку.")
@@ -328,16 +446,16 @@ class GoogleCalendarRuntime:
             self._pending_path(state).unlink(missing_ok=True)
             await self._send_telegram(
                 pending.chat_id,
-                "Календарь подключён. Теперь могу смотреть расписание и искать свободные окна.",
+                self._oauth_success_message(pending.product),
             )
-            return self._html_response("Календарь подключён. Можно вернуться в Telegram.")
+            return self._html_response(self._oauth_success_html(pending.product))
         except Exception as exc:
             logger.exception("google calendar oauth callback failed")
             await self._send_telegram(
                 pending.chat_id,
-                "Календарь не подключился: Google вернул ошибку авторизации. Попробуйте запросить новую ссылку.",
+                self._oauth_error_message(pending.product),
             )
-            return self._html_response(f"Не удалось подключить календарь: {html.escape(str(exc))}", status=500)
+            return self._html_response(f"Не удалось подключить Google: {html.escape(str(exc))}", status=500)
 
     def _range_from_request(self, data: dict[str, Any], tz_name: str) -> tuple[datetime, datetime]:
         tz = ZoneInfo(tz_name)
@@ -443,6 +561,122 @@ class GoogleCalendarRuntime:
                     raise web.HTTPBadGateway(text=json.dumps({"success": False, "error": payload}))
                 return list(payload.get("items") or [])
 
+    async def _google_get_json(
+        self,
+        access_token: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                params=params or {},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as response:
+                payload = await response.json(content_type=None)
+                if response.status >= 400:
+                    raise web.HTTPBadGateway(text=json.dumps({"success": False, "error": payload}))
+                return payload
+
+    async def _gmail_search(
+        self,
+        access_token: str,
+        *,
+        query: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        payload = await self._google_get_json(
+            access_token,
+            GOOGLE_GMAIL_MESSAGES_URL,
+            params={"q": query, "maxResults": str(max_results)},
+        )
+        messages: list[dict[str, Any]] = []
+        for meta in payload.get("messages") or []:
+            message_id = str(meta.get("id") or "")
+            if not message_id:
+                continue
+            message = await self._google_get_json(
+                access_token,
+                f"{GOOGLE_GMAIL_MESSAGES_URL}/{quote(message_id, safe='')}",
+                params={
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "To", "Subject", "Date"],
+                },
+            )
+            headers = self._gmail_headers(message)
+            messages.append(
+                {
+                    "id": message.get("id", ""),
+                    "threadId": message.get("threadId", ""),
+                    "from": headers.get("From", ""),
+                    "to": headers.get("To", ""),
+                    "subject": headers.get("Subject", ""),
+                    "date": headers.get("Date", ""),
+                    "snippet": message.get("snippet", ""),
+                    "labels": message.get("labelIds", []),
+                }
+            )
+        return messages
+
+    async def _gmail_get(self, access_token: str, message_id: str) -> dict[str, Any]:
+        message = await self._google_get_json(
+            access_token,
+            f"{GOOGLE_GMAIL_MESSAGES_URL}/{quote(message_id, safe='')}",
+            params={"format": "full"},
+        )
+        headers = self._gmail_headers(message)
+        return {
+            "id": message.get("id", ""),
+            "threadId": message.get("threadId", ""),
+            "from": headers.get("From", ""),
+            "to": headers.get("To", ""),
+            "subject": headers.get("Subject", ""),
+            "date": headers.get("Date", ""),
+            "labels": message.get("labelIds", []),
+            "snippet": message.get("snippet", ""),
+            "body": self._truncate_text(self._extract_gmail_body(message), 20000),
+        }
+
+    async def _docs_search(
+        self,
+        access_token: str,
+        *,
+        query: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        filters = [
+            "mimeType='application/vnd.google-apps.document'",
+            "trashed=false",
+        ]
+        if query:
+            literal = self._drive_query_literal(query)
+            filters.append(f"(name contains '{literal}' or fullText contains '{literal}')")
+        payload = await self._google_get_json(
+            access_token,
+            GOOGLE_DRIVE_FILES_URL,
+            params={
+                "q": " and ".join(filters),
+                "pageSize": str(max_results),
+                "fields": "files(id,name,mimeType,modifiedTime,webViewLink)",
+                "orderBy": "modifiedTime desc",
+            },
+        )
+        return list(payload.get("files") or [])
+
+    async def _docs_get(self, access_token: str, doc_id: str) -> dict[str, Any]:
+        doc = await self._google_get_json(
+            access_token,
+            GOOGLE_DOCS_DOCUMENT_URL.format(document_id=quote(doc_id, safe="")),
+        )
+        return {
+            "title": doc.get("title", ""),
+            "documentId": doc.get("documentId", doc_id),
+            "body": self._truncate_text(self._extract_doc_text(doc), 50000),
+        }
+
     def _compact_event(self, event: dict[str, Any], tz_name: str) -> dict[str, Any]:
         start_raw = (event.get("start") or {}).get("dateTime") or (event.get("start") or {}).get("date") or ""
         end_raw = (event.get("end") or {}).get("dateTime") or (event.get("end") or {}).get("date") or ""
@@ -499,6 +733,143 @@ class GoogleCalendarRuntime:
                 slots.append({"start": cursor.isoformat(), "end": window_end.isoformat()})
             cursor_day += timedelta(days=1)
         return slots
+
+    def _connect_public_message(self, auth_url: str, product: str) -> str:
+        if product == "workspace":
+            return (
+                "Чтобы подключить Google Почту, Документы и календарь, откройте ссылку и разрешите доступ:\n"
+                f"{auth_url}\n\n"
+                "После подтверждения вернитесь в Telegram — сообщу, когда доступ подключится."
+            )
+        return (
+            "Чтобы подключить Google Calendar, откройте ссылку и разрешите доступ:\n"
+            f"{auth_url}\n\n"
+            "После подтверждения вернитесь в Telegram — сообщу, когда календарь подключится."
+        )
+
+    @staticmethod
+    def _oauth_success_message(product: str) -> str:
+        if product == "workspace":
+            return (
+                "Google Workspace подключён. Теперь могу искать и читать письма, "
+                "Google Docs и календарь по вашему запросу."
+            )
+        return "Календарь подключён. Теперь могу смотреть расписание и искать свободные окна."
+
+    @staticmethod
+    def _oauth_success_html(product: str) -> str:
+        if product == "workspace":
+            return "Google Workspace подключён. Можно вернуться в Telegram."
+        return "Календарь подключён. Можно вернуться в Telegram."
+
+    @staticmethod
+    def _oauth_denied_message(product: str) -> str:
+        if product == "workspace":
+            return "Google Workspace не подключён: доступ не был подтверждён."
+        return "Календарь не подключён: доступ не был подтверждён."
+
+    @staticmethod
+    def _oauth_error_message(product: str) -> str:
+        if product == "workspace":
+            return (
+                "Google Workspace не подключился: Google вернул ошибку авторизации. "
+                "Попробуйте запросить новую ссылку."
+            )
+        return (
+            "Календарь не подключился: Google вернул ошибку авторизации. "
+            "Попробуйте запросить новую ссылку."
+        )
+
+    @staticmethod
+    def _gmail_headers(message: dict[str, Any]) -> dict[str, str]:
+        headers = (message.get("payload") or {}).get("headers") or []
+        return {
+            str(header.get("name") or ""): str(header.get("value") or "")
+            for header in headers
+            if header.get("name")
+        }
+
+    @classmethod
+    def _extract_gmail_body(cls, message: dict[str, Any]) -> str:
+        payload = message.get("payload") or {}
+        plain = cls._find_gmail_part(payload, "text/plain")
+        if plain:
+            return plain
+        html_body = cls._find_gmail_part(payload, "text/html")
+        if html_body:
+            return cls._html_to_text(html_body)
+        return ""
+
+    @classmethod
+    def _find_gmail_part(cls, part: dict[str, Any], mime_type: str) -> str:
+        if part.get("mimeType") == mime_type:
+            data = (part.get("body") or {}).get("data")
+            if data:
+                return cls._decode_b64url(data)
+        for child in part.get("parts") or []:
+            found = cls._find_gmail_part(child, mime_type)
+            if found:
+                return found
+        return ""
+
+    @staticmethod
+    def _decode_b64url(value: str) -> str:
+        padded = value + "=" * (-len(value) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _html_to_text(value: str) -> str:
+        text = re.sub(r"(?is)<(script|style).*?</\1>", "", value)
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?i)</p\s*>", "\n", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @classmethod
+    def _extract_doc_text(cls, node: Any) -> str:
+        parts: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                text_run = value.get("textRun")
+                if isinstance(text_run, dict) and text_run.get("content"):
+                    parts.append(str(text_run["content"]))
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(node.get("body", {}) if isinstance(node, dict) else node)
+        return "".join(parts)
+
+    @staticmethod
+    def _drive_query_literal(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    @staticmethod
+    def _extract_doc_id(value: str) -> str:
+        text = value.strip()
+        if not text:
+            return ""
+        match = re.search(r"/document/d/([A-Za-z0-9_-]+)", text)
+        if match:
+            return match.group(1)
+        if re.fullmatch(r"[A-Za-z0-9_-]{20,}", text):
+            return text
+        return ""
+
+    @staticmethod
+    def _truncate_text(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return value[:limit] + f"\n\n... <truncated {len(value) - limit} chars>"
 
     def _pending_path(self, state: str) -> Path:
         return self.pending_dir / _safe_filename(state)

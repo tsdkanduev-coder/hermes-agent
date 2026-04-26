@@ -167,6 +167,12 @@ TOOLSETS = {
         "tools": ["calendar"],
         "includes": []
     },
+
+    "google_workspace": {
+        "description": "Google Workspace OAuth and read-only Gmail/Docs tools",
+        "tools": ["google_workspace"],
+        "includes": []
+    },
     
     "todo": {
         "description": "Task planning and tracking for multi-step work",

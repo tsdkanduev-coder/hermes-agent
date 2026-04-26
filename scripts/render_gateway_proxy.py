@@ -72,6 +72,9 @@ def _build_gateway_env() -> dict[str, str]:
     env["GOOGLE_CALENDAR_CONTROL_URL"] = (
         f"http://{VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}/calendar"
     )
+    env["GOOGLE_WORKSPACE_CONTROL_URL"] = (
+        f"http://{VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}/workspace"
+    )
     return env
 
 
@@ -164,6 +167,7 @@ class RenderProxy:
             "webhook_path": self.webhook_path,
             "voice": voice_health,
             "calendar": self.calendar.health(),
+            "workspace": self.calendar.workspace_health(),
         }
 
     async def close(self) -> None:
@@ -438,6 +442,13 @@ async def _main_async() -> int:
     control_app.router.add_post("/calendar/disconnect", proxy.calendar.handle_control_disconnect)
     control_app.router.add_post("/calendar/events", proxy.calendar.handle_control_list)
     control_app.router.add_post("/calendar/free-slots", proxy.calendar.handle_control_find_slots)
+    control_app.router.add_post("/workspace/connect", proxy.calendar.handle_workspace_control_connect)
+    control_app.router.add_get("/workspace/status", proxy.calendar.handle_workspace_control_status)
+    control_app.router.add_post("/workspace/disconnect", proxy.calendar.handle_control_disconnect)
+    control_app.router.add_post("/workspace/gmail/search", proxy.calendar.handle_workspace_gmail_search)
+    control_app.router.add_post("/workspace/gmail/get", proxy.calendar.handle_workspace_gmail_get)
+    control_app.router.add_post("/workspace/docs/search", proxy.calendar.handle_workspace_docs_search)
+    control_app.router.add_post("/workspace/docs/get", proxy.calendar.handle_workspace_docs_get)
 
     public_runner = await _start_site(public_app, RENDER_PROXY_HOST, PUBLIC_PORT)
     control_runner = await _start_site(control_app, VOICE_CONTROL_HOST, VOICE_CONTROL_PORT)
