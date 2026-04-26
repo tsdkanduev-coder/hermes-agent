@@ -45,6 +45,7 @@ class StreamConsumerConfig:
     cursor: str = " ▉"
     buffer_only: bool = False
     normalize_interim_status: bool = False
+    suppress_interim_status: bool = False
     long_work_ack_text: str = (
         "Цевдн, взяли ваш запрос в работу. "
         "Потребуется несколько минут, подождите, пожалуйста"
@@ -271,10 +272,12 @@ class GatewayStreamConsumer:
 
     _INTERIM_STATUS_RE = re.compile(
         r"^\s*(?:"
-        r"подбираю|ищу|проверяю|уточняю|собираю|"
-        r"собрал(?:а)?\s+базу|наш[её]л\s+базу|"
-        r"сейчас\s+(?:найду|проверю|уточню|посмотрю|подберу)|"
-        r"заберу|доберу|смотрю|беру|возьму"
+        r"подбира\w*|подбер\w*|ищ\w*|найд\w*|"
+        r"провер\w*|уточн\w*|собира\w*|собер\w*|собрал\w*|"
+        r"наш[её]л\w*|нашла|забер\w*|добер\w*|"
+        r"смотр\w*|посмотр\w*|бер\w*|возьм\w*|"
+        r"доста\w*|готов\w*|подготов\w*|разбира\w*|разбер\w*|"
+        r"сейчас\s+(?:найд\w*|провер\w*|уточн\w*|посмотр\w*|подбер\w*)"
         r")\b",
         re.IGNORECASE,
     )
@@ -294,9 +297,11 @@ class GatewayStreamConsumer:
         return bool(self._INTERIM_STATUS_RE.search(stripped))
 
     def _normalize_interim_status_text(self, text: str) -> str:
-        """Replace repeated model-generated progress chatter with one UX-approved ack."""
+        """Normalize or suppress model-generated progress chatter."""
         if not self.cfg.normalize_interim_status or not self._is_interim_status_text(text):
             return text
+        if self.cfg.suppress_interim_status:
+            return ""
         if self._long_work_ack_sent:
             return ""
         self._long_work_ack_sent = True

@@ -9188,6 +9188,7 @@ class GatewayRunner:
                         cursor=_effective_cursor,
                         buffer_only=_buffer_only,
                         normalize_interim_status=(source.platform == Platform.TELEGRAM),
+                        suppress_interim_status=(source.platform == Platform.TELEGRAM),
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -9812,6 +9813,7 @@ class GatewayRunner:
                             cursor=_effective_cursor,
                             buffer_only=_buffer_only,
                             normalize_interim_status=(source.platform == Platform.TELEGRAM),
+                            suppress_interim_status=(source.platform == Platform.TELEGRAM),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,

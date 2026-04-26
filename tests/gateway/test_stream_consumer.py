@@ -112,6 +112,26 @@ class TestInterimStatusNormalization:
         )
         assert second == ""
 
+    def test_telegram_statuses_are_suppressed(self):
+        adapter = MagicMock()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(
+                normalize_interim_status=True,
+                suppress_interim_status=True,
+            ),
+        )
+
+        samples = [
+            "Собрал главное за сегодня. Уточняю детали по письмам.",
+            "Проверю ещё письма с риском: доступы, платежи, безопасность.",
+            "Нашёл ещё более важные — безопасность и счета. Достаю детали.",
+        ]
+
+        for text in samples:
+            assert consumer._normalize_interim_status_text(text) == ""
+
     def test_final_answer_not_replaced(self):
         adapter = MagicMock()
         consumer = GatewayStreamConsumer(
