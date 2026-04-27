@@ -1430,7 +1430,7 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "GOOGLE_CALENDAR_SCOPES": {
-        "description": "Google Calendar OAuth scopes (default: readonly)",
+        "description": "Google Calendar OAuth scopes (default: event read/write access)",
         "prompt": "Google Calendar scopes",
         "url": None,
         "tools": ["calendar"],

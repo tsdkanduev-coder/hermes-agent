@@ -2,7 +2,13 @@
 
 import base64
 
-from gateway.google_calendar_runtime import GoogleCalendarRuntime
+from gateway.google_calendar_runtime import (
+    CALENDAR_EVENTS_SCOPE,
+    CALENDAR_WRITE_SCOPES,
+    GoogleCalendarRuntime,
+    _has_any_scope,
+    _parse_event_datetime,
+)
 
 
 def _b64url(text: str) -> str:
@@ -66,3 +72,34 @@ def test_extract_google_doc_text_recursively():
     }
 
     assert GoogleCalendarRuntime._extract_doc_text(doc) == "Hello world"
+
+
+def test_calendar_write_scope_detection_accepts_events_scope():
+    assert _has_any_scope(CALENDAR_EVENTS_SCOPE, CALENDAR_WRITE_SCOPES)
+    assert not _has_any_scope(
+        "https://www.googleapis.com/auth/calendar.readonly",
+        CALENDAR_WRITE_SCOPES,
+    )
+
+
+def test_parse_event_datetime_requires_time_and_applies_timezone():
+    parsed = _parse_event_datetime("2026-04-27T15:30:00", "Europe/Moscow")
+
+    assert parsed.tzinfo is not None
+    assert parsed.isoformat().startswith("2026-04-27T15:30:00")
+
+
+def test_attendees_from_value_filters_non_emails_and_deduplicates():
+    attendees = GoogleCalendarRuntime._attendees_from_value(
+        [
+            {"email": "a@example.com", "displayName": "A"},
+            {"email": "A@example.com"},
+            {"email": "not-an-email"},
+            "b@example.com",
+        ]
+    )
+
+    assert attendees == [
+        {"email": "a@example.com", "displayName": "A"},
+        {"email": "b@example.com"},
+    ]

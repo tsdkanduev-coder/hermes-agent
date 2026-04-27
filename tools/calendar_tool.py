@@ -13,17 +13,25 @@ from tools.registry import registry
 CALENDAR_SCHEMA = {
     "name": "calendar",
     "description": (
-        "Connect and read the user's Google Calendar via per-user OAuth. "
+        "Connect, read, and create events in the user's Google Calendar via per-user OAuth. "
         "Use when the user asks to connect calendar, check schedule, list events, "
-        "or find free time. This first version is read-only: do not claim to create, "
-        "edit, or delete calendar events."
+        "find free time, or put a meeting/event into the calendar. Event creation "
+        "requires a clear title/topic, date+time, and guests/participants. Do not "
+        "claim to edit or delete calendar events."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["connect", "status", "list_events", "find_free_slots", "disconnect"],
+                "enum": [
+                    "connect",
+                    "status",
+                    "list_events",
+                    "find_free_slots",
+                    "create_event",
+                    "disconnect",
+                ],
                 "description": "Calendar action to perform.",
             },
             "calendar_id": {
@@ -40,11 +48,14 @@ CALENDAR_SCHEMA = {
             },
             "start": {
                 "type": "string",
-                "description": "ISO datetime range start. Optional alternative to date/days.",
+                "description": (
+                    "ISO datetime range start for reads, or event start for create_event. "
+                    "For create_event it must include both date and time."
+                ),
             },
             "end": {
                 "type": "string",
-                "description": "ISO datetime range end. Optional alternative to date/days.",
+                "description": "ISO datetime range end for reads, or event end for create_event.",
             },
             "timezone": {
                 "type": "string",
@@ -65,6 +76,47 @@ CALENDAR_SCHEMA = {
             "max_results": {
                 "type": "integer",
                 "description": "Maximum events to return, max 50.",
+            },
+            "title": {
+                "type": "string",
+                "description": (
+                    "Event title/topic for create_event. Infer from the user's message "
+                    "or forwarded thread context."
+                ),
+            },
+            "guests": {
+                "type": "string",
+                "description": (
+                    "Human-readable meeting guests/participants for create_event. Required even "
+                    "if attendee emails are not known, e.g. 'Иван, Мария и я'."
+                ),
+            },
+            "attendees": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "email": {"type": "string"},
+                        "displayName": {"type": "string"},
+                    },
+                    "required": ["email"],
+                },
+                "description": (
+                    "Optional attendee email objects. Email invitations are not sent "
+                    "unless send_updates is true."
+                ),
+            },
+            "location": {
+                "type": "string",
+                "description": "Optional event location.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional event description or context from the user's message/thread.",
+            },
+            "send_updates": {
+                "type": "boolean",
+                "description": "Whether Google should email attendee updates. Default false.",
             },
         },
         "required": ["action"],
@@ -128,10 +180,38 @@ def _request_payload(args: dict) -> dict:
         "day_start_hour",
         "day_end_hour",
         "max_results",
+        "title",
+        "guests",
+        "attendees",
+        "location",
+        "description",
+        "send_updates",
     ):
         if args.get(key) not in (None, ""):
             payload[key] = args[key]
     return payload
+
+
+def _format_created_event_message(result: dict) -> str:
+    event = result.get("event") or {}
+    title = str(event.get("summary") or "(без названия)")
+    start = str(event.get("start_local") or event.get("start") or "")
+    end = str(event.get("end_local") or event.get("end") or "")
+    guests = str(result.get("guests") or "")
+    location = str(event.get("location") or "")
+    link = str(event.get("htmlLink") or "")
+    lines = ["Добавил встречу в календарь.", "", f"— Тема: {title}"]
+    if start and end:
+        lines.append(f"— Когда: {start} - {end}")
+    elif start:
+        lines.append(f"— Когда: {start}")
+    if guests:
+        lines.append(f"— Участники: {guests}")
+    if location:
+        lines.append(f"— Место: {location}")
+    if link:
+        lines.extend(["", f"Ссылка: {link}"])
+    return "\n".join(lines)
 
 
 def _check_calendar_requirements() -> bool:
@@ -166,6 +246,21 @@ def calendar_tool(args: dict) -> str:
 
     if action == "find_free_slots":
         result = _http_json("POST", _control_url("/free-slots"), _request_payload(args))
+        return json.dumps(result, ensure_ascii=False)
+
+    if action == "create_event":
+        result = _http_json("POST", _control_url("/events/create"), _request_payload(args))
+        if result.get("success"):
+            result["public_message"] = _format_created_event_message(result)
+            result["assistant_instruction"] = (
+                "Send public_message verbatim as the whole user-facing reply. Do not add "
+                "raw event ids, calendar ids, OAuth scopes, API payloads, or diagnostics."
+            )
+        elif result.get("needs_reconnect"):
+            result["assistant_instruction"] = (
+                "Tell the user briefly that calendar write access needs a fresh Google "
+                "authorization. Offer to reconnect the calendar. Do not expose raw scope names."
+            )
         return json.dumps(result, ensure_ascii=False)
 
     if action == "disconnect":

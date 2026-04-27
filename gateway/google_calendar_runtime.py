@@ -31,7 +31,12 @@ GOOGLE_CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{
 GOOGLE_GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_DOCS_DOCUMENT_URL = "https://docs.googleapis.com/v1/documents/{document_id}"
-DEFAULT_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+CALENDAR_FULL_SCOPE = "https://www.googleapis.com/auth/calendar"
+DEFAULT_CALENDAR_SCOPE = CALENDAR_EVENTS_SCOPE
+CALENDAR_READ_SCOPES = {CALENDAR_READONLY_SCOPE, CALENDAR_EVENTS_SCOPE, CALENDAR_FULL_SCOPE}
+CALENDAR_WRITE_SCOPES = {CALENDAR_EVENTS_SCOPE, CALENDAR_FULL_SCOPE}
 DEFAULT_WORKSPACE_SCOPES = [
     DEFAULT_CALENDAR_SCOPE,
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -76,6 +81,18 @@ def _scopes() -> list[str]:
     return scopes or list(DEFAULT_WORKSPACE_SCOPES)
 
 
+def _has_any_scope(raw: Any, accepted: set[str]) -> bool:
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        scopes = {part.strip() for part in raw.replace(",", " ").split() if part.strip()}
+    elif isinstance(raw, list):
+        scopes = {str(part).strip() for part in raw if str(part).strip()}
+    else:
+        return False
+    return bool(scopes & accepted)
+
+
 def _safe_filename(value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
     return f"{digest}.json"
@@ -96,6 +113,20 @@ def _parse_iso(value: str) -> datetime:
     dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _parse_event_datetime(value: str, tz_name: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("datetime value required")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    if "T" not in text:
+        raise ValueError("event datetime must include date and time")
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(tz_name))
     return dt
 
 
@@ -160,7 +191,8 @@ class GoogleCalendarRuntime:
             "scopes": scopes,
             "connected_users": len(list(self.users_dir.glob("*.json"))),
             "capabilities": {
-                "calendar_read": DEFAULT_CALENDAR_SCOPE in scopes,
+                "calendar_read": _has_any_scope(scopes, CALENDAR_READ_SCOPES),
+                "calendar_write": _has_any_scope(scopes, CALENDAR_WRITE_SCOPES),
                 "gmail_read": "https://www.googleapis.com/auth/gmail.readonly" in scopes,
                 "drive_read": "https://www.googleapis.com/auth/drive.readonly" in scopes,
                 "docs_read": "https://www.googleapis.com/auth/documents.readonly" in scopes,
@@ -418,6 +450,94 @@ class GoogleCalendarRuntime:
             }
         )
 
+    async def handle_control_create_event(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        user_id = str(data.get("user_id") or "").strip()
+        calendar_id = str(data.get("calendar_id") or "primary")
+        tz_name = str(data.get("timezone") or os.environ.get("TZ") or "Europe/Moscow")
+        title = str(data.get("title") or data.get("summary") or "").strip()
+        start_raw = str(data.get("start") or "").strip()
+        end_raw = str(data.get("end") or "").strip()
+        guests = str(data.get("guests") or "").strip()
+        location = str(data.get("location") or "").strip()
+        description = str(data.get("description") or "").strip()
+        duration_min = min(max(int(data.get("duration_min") or 60), 15), 1440)
+        if not title:
+            return web.json_response({"success": False, "error": "event title is required"}, status=400)
+        if not start_raw:
+            return web.json_response(
+                {"success": False, "error": "event start datetime with date and time is required"},
+                status=400,
+            )
+        if not guests:
+            return web.json_response(
+                {"success": False, "error": "event guests or participants are required"},
+                status=400,
+            )
+        try:
+            start_dt = _parse_event_datetime(start_raw, tz_name)
+            end_dt = (
+                _parse_event_datetime(end_raw, tz_name)
+                if end_raw
+                else start_dt + timedelta(minutes=duration_min)
+            )
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=400)
+        if end_dt <= start_dt:
+            return web.json_response(
+                {"success": False, "error": "event end must be after start"},
+                status=400,
+            )
+
+        token_payload = self._load_user_token(user_id)
+        if not token_payload:
+            return web.json_response(
+                {"success": False, "error": "calendar is not connected", "connected": False},
+                status=401,
+            )
+        if not _has_any_scope(token_payload.get("scope"), CALENDAR_WRITE_SCOPES):
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "calendar write access is not granted",
+                    "connected": True,
+                    "needs_reconnect": True,
+                },
+                status=403,
+            )
+        token = await self._valid_access_token(user_id)
+        if not token:
+            return web.json_response(
+                {"success": False, "error": "calendar is not connected", "connected": False},
+                status=401,
+            )
+
+        event_body = self._build_event_body(
+            title=title,
+            start=start_dt,
+            end=end_dt,
+            tz_name=tz_name,
+            guests=guests,
+            description=description,
+            location=location,
+            attendees=data.get("attendees"),
+        )
+        event = await self._create_event(
+            token,
+            calendar_id=calendar_id,
+            event_body=event_body,
+            send_updates=bool(data.get("send_updates")),
+        )
+        return web.json_response(
+            {
+                "success": True,
+                "connected": True,
+                "calendar_id": calendar_id,
+                "event": self._compact_event(event, tz_name),
+                "guests": guests,
+            }
+        )
+
     async def handle_public_callback(self, request: web.Request) -> web.Response:
         state = request.query.get("state", "").strip()
         code = request.query.get("code", "").strip()
@@ -560,6 +680,93 @@ class GoogleCalendarRuntime:
                 if response.status >= 400:
                     raise web.HTTPBadGateway(text=json.dumps({"success": False, "error": payload}))
                 return list(payload.get("items") or [])
+
+    async def _create_event(
+        self,
+        access_token: str,
+        *,
+        calendar_id: str,
+        event_body: dict[str, Any],
+        send_updates: bool,
+    ) -> dict[str, Any]:
+        url = GOOGLE_CALENDAR_EVENTS_URL.format(calendar_id=quote(calendar_id, safe=""))
+        params = {"sendUpdates": "all" if send_updates else "none"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                params=params,
+                json=event_body,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                payload = await response.json(content_type=None)
+                if response.status >= 400:
+                    raise web.HTTPBadGateway(text=json.dumps({"success": False, "error": payload}))
+                return payload
+
+    def _build_event_body(
+        self,
+        *,
+        title: str,
+        start: datetime,
+        end: datetime,
+        tz_name: str,
+        guests: str,
+        description: str,
+        location: str,
+        attendees: Any,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "summary": title,
+            "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+            "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
+        }
+        notes = []
+        if guests:
+            notes.append(f"Гости/участники: {guests}")
+        if description:
+            notes.append(description)
+        if notes:
+            body["description"] = "\n\n".join(notes)
+        if location:
+            body["location"] = location
+        attendee_items = self._attendees_from_value(attendees)
+        if attendee_items:
+            body["attendees"] = attendee_items
+        return body
+
+    @staticmethod
+    def _attendees_from_value(value: Any) -> list[dict[str, str]]:
+        if not value:
+            return []
+        raw_items: list[Any]
+        if isinstance(value, str):
+            raw_items = [part.strip() for part in re.split(r"[,;\s]+", value) if part.strip()]
+        elif isinstance(value, list):
+            raw_items = value
+        else:
+            return []
+        attendees: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            email = ""
+            display_name = ""
+            if isinstance(item, dict):
+                email = str(item.get("email") or "").strip()
+                display_name = str(item.get("displayName") or item.get("display_name") or "").strip()
+            else:
+                email = str(item or "").strip()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                continue
+            email_key = email.lower()
+            if email_key in seen:
+                continue
+            seen.add(email_key)
+            attendee = {"email": email}
+            if display_name:
+                attendee["displayName"] = display_name
+            attendees.append(attendee)
+        return attendees
 
     async def _google_get_json(
         self,
@@ -752,9 +959,9 @@ class GoogleCalendarRuntime:
         if product == "workspace":
             return (
                 "Google Workspace подключён. Теперь могу искать и читать письма, "
-                "Google Docs и календарь по вашему запросу."
+                "Google Docs, календарь и добавлять встречи по вашему запросу."
             )
-        return "Календарь подключён. Теперь могу смотреть расписание и искать свободные окна."
+        return "Календарь подключён. Теперь могу смотреть расписание, искать свободные окна и добавлять встречи."
 
     @staticmethod
     def _oauth_success_html(product: str) -> str:

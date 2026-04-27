@@ -441,6 +441,7 @@ async def _main_async() -> int:
     control_app.router.add_get("/calendar/status", proxy.calendar.handle_control_status)
     control_app.router.add_post("/calendar/disconnect", proxy.calendar.handle_control_disconnect)
     control_app.router.add_post("/calendar/events", proxy.calendar.handle_control_list)
+    control_app.router.add_post("/calendar/events/create", proxy.calendar.handle_control_create_event)
     control_app.router.add_post("/calendar/free-slots", proxy.calendar.handle_control_find_slots)
     control_app.router.add_post("/workspace/connect", proxy.calendar.handle_workspace_control_connect)
     control_app.router.add_get("/workspace/status", proxy.calendar.handle_workspace_control_status)
