@@ -206,11 +206,13 @@ registry.register(
     handler=lambda args, **kw: voice_call_tool(args),
     check_fn=_check_voice_call_requirements,
     requires_env=[
-        "VOICE_CALL_CONTROL_URL",
-        "VOXIMPLANT_RULE_ID",
-        "VOXIMPLANT_WEBHOOK_SECRET",
-        "OPENAI_API_KEY or XAI_API_KEY",
+        "VOICE_CALL_CONTROL_URL (or RENDER for render-gateway-proxy)",
         "TELEGRAM_BOT_TOKEN",
+        "If VOICE_CALL_BACKEND=gigacaller: GIGACALLER_WSS_URL optional (has dev default), "
+        "GIGACALLER_GUEST_PHONE recommended; GIGACALLER_INSECURE_SSL=1 only for broken CA.",
+        "If VOICE_CALL_BACKEND unset (voximplant): VOXIMPLANT_* + OPENAI_API_KEY or XAI_API_KEY "
+        "+ VOICE_CALL_FROM_NUMBER.",
+        "OPENAI_API_KEY optional for post-call summary (both backends).",
     ],
     emoji="",
 )

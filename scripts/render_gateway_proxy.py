@@ -22,7 +22,6 @@ import aiohttp
 from aiohttp import web
 
 from gateway.google_calendar_runtime import GoogleCalendarRuntime, delayed_cleanup_pending
-from gateway.voice_call_runtime import VoiceCallRuntime
 
 
 PUBLIC_PORT = int(os.environ.get("PORT", "10000"))
@@ -143,11 +142,22 @@ def _port_is_open(host: str, port: int) -> bool:
         return False
 
 
+def _make_voice_runtime():
+    backend = os.environ.get("VOICE_CALL_BACKEND", "voximplant").strip().lower()
+    if backend in {"gigacaller", "giga"}:
+        from gateway.gigacaller_voice_runtime import GigaCallerVoiceRuntime
+
+        return GigaCallerVoiceRuntime()
+    from gateway.voice_call_runtime import VoiceCallRuntime
+
+    return VoiceCallRuntime()
+
+
 class RenderProxy:
     def __init__(self, gateway_proc: subprocess.Popen[bytes], webhook_path: str):
         self.gateway_proc = gateway_proc
         self.webhook_path = webhook_path
-        self.voice = VoiceCallRuntime()
+        self.voice = _make_voice_runtime()
         self.calendar = GoogleCalendarRuntime()
         self.client = aiohttp.ClientSession()
 
@@ -455,10 +465,12 @@ async def _main_async() -> int:
     control_runner = await _start_site(control_app, VOICE_CONTROL_HOST, VOICE_CONTROL_PORT)
     calendar_cleanup_task = asyncio.create_task(delayed_cleanup_pending(proxy.calendar))
 
+    _vb = os.environ.get("VOICE_CALL_BACKEND", "voximplant").strip().lower()
     print(
         f"[render-proxy] Listening on {RENDER_PROXY_HOST}:{PUBLIC_PORT}; "
         f"Telegram {webhook_path} -> {HEALTH_HOST}:{INTERNAL_PORT}{webhook_path}; "
-        f"voice webhook {proxy.voice.webhook_path}; voice stream {proxy.voice.stream_path}; "
+        f"voice backend={_vb}; voice webhook {proxy.voice.webhook_path}; "
+        f"voice stream {proxy.voice.stream_path}; "
         f"voice/calendar control {VOICE_CONTROL_HOST}:{VOICE_CONTROL_PORT}; "
         f"calendar callback {proxy.calendar.callback_path}",
         flush=True,
