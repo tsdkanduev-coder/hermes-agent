@@ -47,7 +47,7 @@ class StreamConsumerConfig:
     normalize_interim_status: bool = False
     suppress_interim_status: bool = False
     long_work_ack_text: str = (
-        "Цевдн, взяли ваш запрос в работу. "
+        "Взял ваш запрос в работу. "
         "Потребуется несколько минут, подождите, пожалуйста"
     )
 

@@ -107,7 +107,7 @@ class TestInterimStatusNormalization:
         )
 
         assert first == (
-            "Цевдн, взяли ваш запрос в работу. "
+            "Взял ваш запрос в работу. "
             "Потребуется несколько минут, подождите, пожалуйста"
         )
         assert second == ""
