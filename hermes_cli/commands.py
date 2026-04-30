@@ -57,6 +57,9 @@ class CommandDef:
 # ---------------------------------------------------------------------------
 
 COMMAND_REGISTRY: list[CommandDef] = [
+    CommandDef("start", "Show the Giga Assistant onboarding message", "Info",
+               gateway_only=True),
+
     # Session
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",)),
@@ -297,6 +300,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "queue",
         "restart",
         "status",
+        "start",
         "steer",
         "stop",
         "update",

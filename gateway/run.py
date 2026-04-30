@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -3464,6 +3465,9 @@ class GatewayRunner:
 
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
+            if _cmd_def_inner and _cmd_def_inner.name == "start":
+                return await self._handle_start_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name in _DEDICATED_HANDLERS:
                 if _cmd_def_inner.name == "help":
                     return await self._handle_help_command(event)
@@ -3628,6 +3632,9 @@ class GatewayRunner:
 
         if canonical == "new":
             return await self._handle_reset_command(event)
+
+        if canonical == "start":
+            return await self._handle_start_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -5417,6 +5424,56 @@ class GatewayRunner:
             if time.time() - requested_at > 300:
                 return False
         return event.platform_update_id <= recorded_uid
+
+
+    async def _handle_start_command(self, event: MessageEvent) -> str:
+        """Handle /start with a product onboarding message, without invoking the LLM."""
+        source = event.source
+        existing_user = False
+        try:
+            if source.user_id:
+                for entry in self.session_store.list_sessions():
+                    origin = getattr(entry, "origin", None)
+                    if (
+                        origin
+                        and origin.platform == source.platform
+                        and str(origin.user_id or "") == str(source.user_id)
+                    ):
+                        existing_user = True
+                        break
+            self.session_store.get_or_create_session(source)
+        except Exception as exc:
+            logger.debug("/start session tracking failed: %s", exc)
+
+        user_hash = "unknown"
+        if source.user_id:
+            raw = f"{source.platform.value}:{source.user_id}".encode("utf-8", errors="replace")
+            user_hash = hashlib.sha256(raw).hexdigest()[:12]
+        logger.info(
+            "telegram_start user_hash=%s chat_type=%s first_seen=%s has_name=%s",
+            user_hash,
+            source.chat_type,
+            str(not existing_user).lower(),
+            str(bool(source.user_name)).lower(),
+        )
+
+        greeting = "Добрый день."
+        if source.user_name:
+            greeting = f"{source.user_name}, добрый день."
+
+        return (
+            f"{greeting} Я Гига Помощник.\n\n"
+            "Помогу с задачами, где удобно делегировать рутину: найти информацию, "
+            "подобрать место, позвонить и забронировать, разобрать почту, "
+            "посмотреть календарь, напомнить о важном.\n\n"
+            "Просто напишите задачу обычным сообщением. Например:\n"
+            "— подобрать ресторан на сегодня\n"
+            "— позвонить и забронировать столик\n"
+            "— найти важные письма за неделю\n"
+            "— поставить встречу в календарь\n\n"
+            "Если понадобится календарь, почта или документы, пришлю безопасную ссылку "
+            "для подключения Google-доступа."
+        )
 
 
     async def _handle_help_command(self, event: MessageEvent) -> str:

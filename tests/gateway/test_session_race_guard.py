@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,7 +63,9 @@ def _make_runner():
     runner._is_user_authorized = lambda _source: True
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
     runner.session_store = MagicMock()
+    runner.session_store.list_sessions.return_value = []
     runner.delivery_router = MagicMock()
     return runner
 
@@ -302,6 +305,7 @@ async def test_command_messages_do_not_leave_sentinel():
     ("command_text", "handler_attr", "handler_result"),
     [
         ("/help", "_handle_help_command", "Help text"),
+        ("/start", "_handle_start_command", "Start text"),
         ("/commands", "_handle_commands_command", "Commands text"),
         ("/update", "_handle_update_command", "Update text"),
         ("/profile", "_handle_profile_command", "Profile text"),
@@ -327,6 +331,27 @@ async def test_active_session_bypass_commands_dispatch_without_interrupt(
     assert result == handler_result
     fake_agent.interrupt.assert_not_called()
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_start_command_returns_product_intro_without_agent(caplog):
+    """Telegram /start should be a product onboarding message, not Hermes help."""
+    runner = _make_runner()
+    event = _make_event(text="/start")
+    event.source.user_name = "Pavel"
+    session_key = build_session_key(event.source)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        result = await runner._handle_message(event)
+
+    assert "Pavel, добрый день" in result
+    assert "Гига Помощник" in result
+    assert "Google-доступа" in result
+    assert "Hermes" not in result
+    assert "/commands" not in result
+    runner.session_store.get_or_create_session.assert_called_once_with(event.source)
+    assert session_key not in runner._running_agents
+    assert "telegram_start user_hash=" in caplog.text
 
 
 # ------------------------------------------------------------------
