@@ -65,6 +65,14 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROVIDER = "local"
+SALUTE_DEFAULT_BASE_URL = "https://smartspeech.sber.ru/rest/v1"
+SALUTE_MAX_BYTES = 2 * 1024 * 1024  # SaluteSpeech sync recognise: 2 MB hard cap
+SALUTE_MAX_SECONDS = 60.0
+
+
+def _salute_base_url() -> str:
+    """Read base URL at call time so .env loaded after import still applies."""
+    return (os.getenv("SBER_SALUTE_BASE_URL") or SALUTE_DEFAULT_BASE_URL).rstrip("/")
 DEFAULT_LOCAL_MODEL = "base"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
@@ -199,6 +207,16 @@ def _get_provider(stt_config: dict) -> str:
     # --- Explicit provider: respect the user's choice ----------------------
 
     if explicit:
+        if provider == "salute":
+            from tools.sber_salute_auth import get_salute_credentials
+            if get_salute_credentials() is not None:
+                return "salute"
+            logger.warning(
+                "STT provider 'salute' configured but SBER_SALUTE_AUTH_KEY "
+                "(or SBER_SALUTE_CLIENT_ID + SBER_SALUTE_CLIENT_SECRET) not set"
+            )
+            return "none"
+
         if provider == "local":
             if _HAS_FASTER_WHISPER:
                 return "local"
@@ -256,8 +274,12 @@ def _get_provider(stt_config: dict) -> str:
 
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > mistral > xai -
+    # --- Auto-detect (no explicit provider): salute > local > groq > openai > mistral > xai -
 
+    from tools.sber_salute_auth import get_salute_credentials
+    if get_salute_credentials() is not None:
+        logger.info("Using Sber SaluteSpeech for STT (credentials detected)")
+        return "salute"
     if _HAS_FASTER_WHISPER:
         return "local"
     if _has_local_command():
@@ -688,6 +710,204 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: Sber SaluteSpeech
+# ---------------------------------------------------------------------------
+
+
+def _prepare_salute_payload(file_path: str) -> tuple[bytes, str]:
+    """Read *file_path* and return ``(audio_bytes, content_type)`` for Salute.
+
+    Sber's sync ``speech:recognize`` endpoint accepts a fixed set of
+    Content-Types; we pick the closest match for each common extension.
+    For WAV we strip the RIFF header and stream raw 16-bit PCM at the
+    declared sample rate, since Sber doesn't accept ``audio/wav`` directly.
+    """
+    import wave
+    from tools.sber_salute_auth import SmartSpeechError
+
+    suffix = Path(file_path).suffix.lower()
+
+    if suffix == ".wav":
+        with wave.open(file_path, "rb") as wav:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            framerate = wav.getframerate()
+            # Sber's own TTS WAVs ship with a sentinel ``n_frames`` near
+            # UINT32_MAX ("streaming" RIFF). ``readframes`` of that count
+            # would attempt a multi-GB allocation on some platforms; cap to
+            # a sane upper bound (1 GB of frames covers everything Sber's
+            # 60-second sync API could ever return).
+            n_frames = min(wav.getnframes(), 10 ** 9)
+            frames = wav.readframes(n_frames)
+
+        if sample_width != 2:
+            raise SmartSpeechError(
+                f"WAV must be 16-bit PCM for SaluteSpeech (got {sample_width * 8}-bit)"
+            )
+        if channels > 1:
+            # Average interleaved 16-bit signed samples into mono.  ``audioop``
+            # is removed in Python 3.13, so do it by hand.
+            import array
+            samples = array.array("h")
+            samples.frombytes(frames)
+            mono = array.array("h", [0] * (len(samples) // channels))
+            for i in range(len(mono)):
+                acc = 0
+                base = i * channels
+                for c in range(channels):
+                    acc += samples[base + c]
+                mono[i] = max(-32768, min(32767, acc // channels))
+            frames = mono.tobytes()
+
+        return frames, f"audio/x-pcm;bit=16;rate={framerate}"
+
+    if suffix in (".ogg", ".opus"):
+        return Path(file_path).read_bytes(), "audio/ogg;codecs=opus"
+    if suffix in (".mp3", ".mpga", ".mpeg"):
+        return Path(file_path).read_bytes(), "audio/mpeg"
+    if suffix == ".flac":
+        return Path(file_path).read_bytes(), "audio/flac"
+
+    raise SmartSpeechError(
+        f"SaluteSpeech does not accept '{suffix}' directly. Convert to wav, ogg, mp3, or flac."
+    )
+
+
+def _transcribe_salute(file_path: str, _model_name: str) -> Dict[str, Any]:
+    """Transcribe via Sber SaluteSpeech ``POST /rest/v1/speech:recognize``.
+
+    The sync endpoint caps inputs at 2 MB and 60 seconds; we validate up
+    front so we don't waste a network round-trip on oversized files.
+    On HTTP 401 we invalidate the cached token once and retry.
+    """
+    from tools.sber_salute_auth import (
+        SmartSpeechError as _SaluteAuthError,
+        get_access_token,
+        get_verify,
+        invalidate_cached_token,
+    )
+
+    try:
+        size = Path(file_path).stat().st_size
+    except OSError as exc:
+        return {"success": False, "transcript": "", "error": f"Failed to access file: {exc}"}
+    if size > SALUTE_MAX_BYTES:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": (
+                f"SaluteSpeech sync recognise rejects files >{SALUTE_MAX_BYTES // (1024 * 1024)} MB "
+                f"(got {size / (1024 * 1024):.1f} MB). Convert to lower bitrate or split."
+            ),
+        }
+
+    if file_path.lower().endswith(".wav"):
+        try:
+            import wave
+            with wave.open(file_path, "rb") as wav:
+                framerate = wav.getframerate() or 1
+                width = wav.getsampwidth() or 2
+                channels = wav.getnchannels() or 1
+                header_frames = wav.getnframes()
+            # Sber's TTS emits streaming WAVs with a sentinel ``n_frames`` close
+            # to UINT32_MAX, which would falsely trip the duration cap below.
+            # Cross-check against file size: bytes / (width * channels) is an
+            # upper bound on real frame count, so we trust the smaller value.
+            bytes_per_frame = max(1, width * channels)
+            size_frames = max(0, size - 64) // bytes_per_frame
+            n_frames = min(header_frames, size_frames) if header_frames else size_frames
+            duration = n_frames / float(framerate)
+            if duration > SALUTE_MAX_SECONDS:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": (
+                        f"SaluteSpeech sync recognise caps audio at {int(SALUTE_MAX_SECONDS)}s "
+                        f"(got {duration:.1f}s)."
+                    ),
+                }
+        except wave.Error:
+            # Malformed WAV — let the API surface the real error.
+            pass
+
+    try:
+        audio_bytes, content_type = _prepare_salute_payload(file_path)
+    except _SaluteAuthError as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
+
+    try:
+        import requests
+
+        def _do_post(token: str) -> "requests.Response":
+            return requests.post(
+                f"{_salute_base_url()}/speech:recognize",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": content_type,
+                },
+                data=audio_bytes,
+                timeout=120,
+                verify=get_verify(),
+            )
+
+        token = get_access_token()
+        response = _do_post(token)
+        if response.status_code == 401:
+            invalidate_cached_token()
+            token = get_access_token(force_refresh=True)
+            response = _do_post(token)
+
+        if response.status_code != 200:
+            body = ""
+            try:
+                body = response.text[:300]
+            except Exception:
+                body = ""
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"SaluteSpeech speech:recognize failed (HTTP {response.status_code}): {body}",
+            }
+
+        payload = response.json()
+        results = payload.get("result") if isinstance(payload, dict) else None
+        transcript = ""
+        if isinstance(results, list) and results:
+            first = results[0]
+            if isinstance(first, str):
+                transcript = first.strip()
+            elif isinstance(first, dict):
+                # Some responses wrap text in {"normalized_text": "..."} or similar.
+                transcript = (
+                    first.get("normalized_text")
+                    or first.get("text")
+                    or ""
+                ).strip()
+
+        if not transcript:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "SaluteSpeech returned an empty transcript",
+            }
+
+        logger.info(
+            "Transcribed %s via Sber SaluteSpeech (%d chars)",
+            Path(file_path).name,
+            len(transcript),
+        )
+        return {"success": True, "transcript": transcript, "provider": "salute"}
+
+    except _SaluteAuthError as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as exc:
+        logger.error("SaluteSpeech transcription failed: %s", exc, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"SaluteSpeech transcription failed: {exc}"}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -726,6 +946,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         }
 
     provider = _get_provider(stt_config)
+
+    if provider == "salute":
+        return _transcribe_salute(file_path, model or "salute")
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})
@@ -766,7 +989,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         "success": False,
         "transcript": "",
         "error": (
-            "No STT provider available. Install faster-whisper for free local "
+            "No STT provider available. Set SBER_SALUTE_AUTH_KEY for Sber SaluteSpeech, "
+            "install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
             "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "

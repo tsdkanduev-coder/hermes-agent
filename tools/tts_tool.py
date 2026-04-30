@@ -115,6 +115,8 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
+DEFAULT_SALUTE_VOICE = "May_24000"
+DEFAULT_SALUTE_BASE_URL = "https://smartspeech.sber.ru/rest/v1"
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -139,6 +141,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
+    "salute": 4000,       # Sber SaluteSpeech text:synthesize practical cap
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -452,6 +455,89 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
         timeout=60,
     )
     response.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    return output_path
+
+
+# ===========================================================================
+# Provider: Sber SaluteSpeech TTS
+# ===========================================================================
+def _generate_salute_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio via Sber SaluteSpeech ``POST /rest/v1/text:synthesize``.
+
+    Authenticates with a 30-minute Bearer token obtained by exchanging the
+    Authorization Key (``SBER_SALUTE_AUTH_KEY``) at the Sber OAuth endpoint;
+    see ``tools/sber_salute_auth.py``.  On HTTP 401 we invalidate the cached
+    token once and retry, since the most likely cause is an expired token.
+    """
+    import requests
+    from tools.sber_salute_auth import (
+        SmartSpeechError,
+        get_access_token,
+        get_verify,
+        invalidate_cached_token,
+    )
+
+    salute_config = tts_config.get("salute", {})
+    voice = str(salute_config.get("voice") or DEFAULT_SALUTE_VOICE).strip() or DEFAULT_SALUTE_VOICE
+    base_url = str(
+        salute_config.get("base_url")
+        or os.getenv("SBER_SALUTE_BASE_URL")
+        or DEFAULT_SALUTE_BASE_URL
+    ).strip().rstrip("/")
+
+    # Map output extension to Sber's ``format=`` query param.  ``wav16`` is
+    # the safest default — it returns a ready-to-play WAV that ffmpeg can
+    # later transcode to OGG Opus for Telegram voice bubbles.
+    lower = output_path.lower()
+    if lower.endswith(".ogg") or lower.endswith(".opus"):
+        fmt = "opus"
+    elif lower.endswith(".pcm"):
+        fmt = "pcm16"
+    elif lower.endswith(".alaw"):
+        fmt = "alaw"
+    else:
+        fmt = "wav16"
+
+    def _do_post(token: str) -> "requests.Response":
+        return requests.post(
+            f"{base_url}/text:synthesize",
+            params={"format": fmt, "voice": voice},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/text",
+            },
+            data=text.encode("utf-8"),
+            timeout=60,
+            verify=get_verify(),
+        )
+
+    token = get_access_token()
+    response = _do_post(token)
+    if response.status_code == 401:
+        invalidate_cached_token()
+        token = get_access_token(force_refresh=True)
+        response = _do_post(token)
+
+    if response.status_code != 200:
+        body = response.text[:300] if response.text else ""
+        raise SmartSpeechError(
+            f"SaluteSpeech text:synthesize failed (HTTP {response.status_code}): {body}",
+            status_code=response.status_code,
+        )
+
+    # Sber occasionally returns HTTP 200 with a JSON error envelope (e.g.
+    # quota exhausted).  Refuse to write JSON into a .wav file.
+    resp_ct = (response.headers.get("Content-Type") or "").lower()
+    if "audio" not in resp_ct and "octet-stream" not in resp_ct:
+        body = response.text[:300] if response.text else ""
+        raise SmartSpeechError(
+            f"SaluteSpeech text:synthesize returned non-audio body (Content-Type={resp_ct!r}): {body}",
+            status_code=response.status_code,
+        )
 
     with open(output_path, "wb") as f:
         f.write(response.content)
@@ -968,8 +1054,12 @@ def text_to_speech_tool(
         out_dir.mkdir(parents=True, exist_ok=True)
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini"):
+        if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini", "salute"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
+        elif provider == "salute":
+            # Salute returns WAV by default; Telegram can deliver WAV as audio,
+            # and ffmpeg later transcodes to .ogg if the platform demands Opus.
+            file_path = out_dir / f"tts_{timestamp}.wav"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
 
@@ -1024,6 +1114,20 @@ def text_to_speech_tool(
         elif provider == "gemini":
             logger.info("Generating speech with Google Gemini TTS...")
             _generate_gemini_tts(text, file_str, tts_config)
+
+        elif provider == "salute":
+            from tools.sber_salute_auth import get_salute_credentials
+            if get_salute_credentials() is None:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        "SaluteSpeech provider selected but credentials are missing. "
+                        "Set SBER_SALUTE_AUTH_KEY (Authorization Key from Sber Studio) "
+                        "or SBER_SALUTE_CLIENT_ID + SBER_SALUTE_CLIENT_SECRET."
+                    ),
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Sber SaluteSpeech...")
+            _generate_salute_tts(text, file_str, tts_config)
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -1087,13 +1191,16 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
+        if file_str.endswith(".ogg"):
+            # Provider produced a native Opus stream we can deliver as-is.
+            voice_compatible = True
+        elif provider in ("edge", "neutts", "minimax", "xai", "kittentts", "salute"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
         elif provider in ("elevenlabs", "openai", "mistral", "gemini"):
-            voice_compatible = file_str.endswith(".ogg")
+            voice_compatible = False
 
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)

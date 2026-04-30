@@ -624,7 +624,12 @@ DEFAULT_CONFIG = {
     # limit (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware,
     # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" (local)
+        "provider": "edge",  # "edge" (free) | "salute" (Sber, ru) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "neutts" (local) | "kittentts" (local)
+        "salute": {
+            "voice": "May_24000",
+            # Other ru voices: Nec_24000 (Наталья), Bys_24000 (м), Tur_24000 (м, эмоции), Pon_24000.
+            # Set SBER_SALUTE_AUTH_KEY (Authorization Key from Sber Studio) in env.
+        },
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -658,7 +663,10 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
+        "provider": "local",  # "local" (free, faster-whisper) | "salute" (Sber, ru) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "xai"
+        "salute": {
+            # Sync recognise: max 2 MB / 60 s. Set SBER_SALUTE_AUTH_KEY in env.
+        },
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
