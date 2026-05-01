@@ -46,6 +46,26 @@ def test_voice_vad_defaults_to_labota_fast_turn_taking(monkeypatch):
     assert _voice_vad_eagerness() == "high"
 
 
+def test_telegram_calendar_link_is_hidden_behind_text_entity():
+    text = (
+        "Бронь подтверждена.\n\n"
+        "📅 Добавить в календарь: "
+        "https://calendar.google.com/calendar/render?action=TEMPLATE&text=%D0%A2%D0%B5%D1%81%D1%82"
+    )
+
+    visible, entities = VoiceCallRuntime._telegram_calendar_link_entities(text)
+
+    assert visible == "Бронь подтверждена.\n\n📅 Добавить в календарь"
+    assert entities == [
+        {
+            "type": "text_link",
+            "offset": len("Бронь подтверждена.\n\n"),
+            "length": VoiceCallRuntime._telegram_utf16_len("📅 Добавить в календарь"),
+            "url": "https://calendar.google.com/calendar/render?action=TEMPLATE&text=%D0%A2%D0%B5%D1%81%D1%82",
+        }
+    ]
+
+
 def test_russian_greeting_name_transliterates_first_latin_token():
     from gateway.run import GatewayRunner
 

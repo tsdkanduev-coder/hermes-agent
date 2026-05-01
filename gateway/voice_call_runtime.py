@@ -70,6 +70,9 @@ CALENDAR_LINK_NEGATIVE_RE = re.compile(
     r"мест нет|к сожалению|отказ|ошибк)",
     re.IGNORECASE,
 )
+CALENDAR_TEMPLATE_LINK_RE = re.compile(
+    r"📅 Добавить в календарь:\s*(https://calendar\.google\.com/calendar/render\?\S+)"
+)
 WEEKDAY_ALIASES = {
     "понедельник": 0,
     "понедельника": 0,
@@ -1165,14 +1168,18 @@ class VoiceCallRuntime:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             return
+        message_text, entities = self._telegram_calendar_link_entities(text)
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": message_text[:3900],
+            "disable_web_page_preview": True,
+        }
+        if entities:
+            payload["entities"] = entities
         async with aiohttp.ClientSession() as session:
             await session.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text[:3900],
-                    "disable_web_page_preview": "calendar.google.com/calendar/render" not in text,
-                },
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=20),
             )
 
@@ -1283,6 +1290,25 @@ class VoiceCallRuntime:
             location=location,
         )
         return f"{text.rstrip()}\n\n📅 Добавить в календарь: {link}"
+
+    @staticmethod
+    def _telegram_utf16_len(text: str) -> int:
+        return len(text.encode("utf-16-le")) // 2
+
+    @classmethod
+    def _telegram_calendar_link_entities(cls, text: str) -> tuple[str, list[dict[str, Any]]]:
+        match = CALENDAR_TEMPLATE_LINK_RE.search(text)
+        if not match:
+            return text, []
+        label = "📅 Добавить в календарь"
+        visible_text = f"{text[:match.start()]}{label}{text[match.end():]}"
+        offset = cls._telegram_utf16_len(visible_text[: match.start()])
+        length = cls._telegram_utf16_len(label)
+        if cls._telegram_utf16_len(visible_text[:3900]) < offset + length:
+            return visible_text, []
+        return visible_text, [
+            {"type": "text_link", "offset": offset, "length": length, "url": match.group(1)}
+        ]
 
     def _infer_calendar_start(self, text: str, call: CallRecord) -> datetime | None:
         tz_name = os.environ.get("TZ") or "Europe/Moscow"
@@ -1449,10 +1475,7 @@ class VoiceCallRuntime:
                 f"Твоя задача: {task}.",
                 "Говори только по-русски, естественно, спокойно и вежливо.",
                 "Каждая реплика должна быть короткой: один вопрос или одно уточнение за раз.",
-                "После каждой своей реплики полностью остановись и жди ответа человека.",
-                "Не отвечай на междометия и короткие паузы. Если человек говорит фрагментами, дождись законченной фразы.",
-                "Лучше подождать лишнюю секунду, чем перебить собеседника.",
-                "Не продолжай сценарий сам. Не озвучивай следующий шаг, пока собеседник явно не ответил.",
+                "После каждой своей реплики остановись и жди ответа человека.",
                 "Если слышишь тишину, шум, 'алло' или 'вас не слышно', коротко повтори последнюю понятную фразу и снова жди.",
                 "Если задача выполнена или человек отказал, коротко поблагодари и заверши разговор.",
             ]
