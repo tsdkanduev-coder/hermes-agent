@@ -2,6 +2,7 @@ from gateway.voice_call_runtime import (
     CallRecord,
     SaluteSpeechTranscriber,
     VoiceCallRuntime,
+    _voice_vad_eagerness,
 )
 
 
@@ -32,6 +33,17 @@ def test_salute_transcript_extractor_handles_common_payloads():
     assert SaluteSpeechTranscriber._extract_transcript(
         '{"results":[{"text":"Добрый день."},{"normalized_text":"Слушаю вас."}]}'
     ) == "Добрый день. Слушаю вас."
+
+
+def test_voice_vad_defaults_to_labota_fast_turn_taking(monkeypatch):
+    monkeypatch.delenv("VOICE_CALL_VAD_EAGERNESS", raising=False)
+    assert _voice_vad_eagerness() == "high"
+
+    monkeypatch.setenv("VOICE_CALL_VAD_EAGERNESS", "low")
+    assert _voice_vad_eagerness() == "low"
+
+    monkeypatch.setenv("VOICE_CALL_VAD_EAGERNESS", "unexpected")
+    assert _voice_vad_eagerness() == "high"
 
 
 def test_russian_greeting_name_transliterates_first_latin_token():

@@ -206,8 +206,8 @@ def _voice_realtime_voice(provider: str) -> str:
 
 
 def _voice_vad_eagerness() -> str:
-    raw = os.environ.get("VOICE_CALL_VAD_EAGERNESS", "low").strip().lower()
-    return raw if raw in {"low", "medium", "high", "auto"} else "low"
+    raw = os.environ.get("VOICE_CALL_VAD_EAGERNESS", "high").strip().lower()
+    return raw if raw in {"low", "medium", "high", "auto"} else "high"
 
 
 def _voice_transcription_provider() -> str:
@@ -650,7 +650,7 @@ class VoiceCallRuntime:
                 return
             if not realtime_ready.is_set() or not vox_started.is_set():
                 return
-            if not _truthy(os.environ.get("VOICE_CALL_INITIAL_RESPONSE", "1")):
+            if not _truthy(os.environ.get("VOICE_CALL_INITIAL_RESPONSE", "0")):
                 return
             initial_response_sent = True
             await realtime.create_initial_response()
@@ -1502,6 +1502,11 @@ class RealtimeVoiceBridge:
         self.reader_task: asyncio.Task | None = None
         self._assistant_text = ""
 
+    def _mark_metric_once(self, name: str) -> None:
+        if name not in self.call.metrics:
+            self.call.metrics[name] = _voice_metric_now()
+            self.call.touch()
+
     async def connect(self) -> None:
         self.session = aiohttp.ClientSession()
         if self.provider == "xai":
@@ -1629,7 +1634,38 @@ class RealtimeVoiceBridge:
             except json.JSONDecodeError:
                 continue
             event_type = str(event.get("type") or "")
+            if event_type == "input_audio_buffer.speech_started":
+                self._mark_metric_once("first_speech_started_at")
+                logger.info("voice_call realtime speech_started call_id=%s", self.call.call_id)
+                continue
+            if event_type == "input_audio_buffer.speech_stopped":
+                self._mark_metric_once("first_speech_stopped_at")
+                logger.info("voice_call realtime speech_stopped call_id=%s", self.call.call_id)
+                continue
+            if event_type == "input_audio_buffer.committed":
+                self._mark_metric_once("first_audio_committed_at")
+                logger.info("voice_call realtime audio_committed call_id=%s", self.call.call_id)
+                continue
+            if event_type == "response.created":
+                self._mark_metric_once("first_response_created_at")
+                logger.info("voice_call realtime response_created call_id=%s", self.call.call_id)
+                continue
+            if event_type == "response.done":
+                self._mark_metric_once("first_response_done_at")
+                response = event.get("response")
+                status = response.get("status") if isinstance(response, dict) else None
+                details = None
+                if isinstance(response, dict):
+                    details = response.get("status_details") or response.get("error")
+                logger.info(
+                    "voice_call realtime response_done call_id=%s status=%s details=%s",
+                    self.call.call_id,
+                    status or "unknown",
+                    details,
+                )
+                continue
             if event_type in {"response.audio.delta", "response.output_audio.delta"}:
+                self._mark_metric_once("first_realtime_audio_delta_at")
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     await self.on_assistant_audio(base64.b64decode(delta))
@@ -1665,4 +1701,5 @@ class RealtimeVoiceBridge:
                     self.on_transcript("callee", text)
                 continue
             if event_type == "error":
+                self._mark_metric_once("first_realtime_error_at")
                 logger.warning("voice_call realtime error provider=%s event=%s", self.provider, event)
