@@ -310,6 +310,16 @@ class RenderProxy:
         finally:
             conn.close()
 
+    async def admin_voice_calls(self, request: web.Request) -> web.Response:
+        if not self._admin_authorized(request):
+            return web.json_response({"detail": "Not found"}, status=404)
+        return await self.voice.handle_control_history(request)
+
+    async def admin_voice_call_status(self, request: web.Request) -> web.Response:
+        if not self._admin_authorized(request):
+            return web.json_response({"detail": "Not found"}, status=404)
+        return await self.voice.handle_control_status(request)
+
     def _collect_trace_logs(
         self,
         *,
@@ -329,6 +339,10 @@ class RenderProxy:
             "web_search",
             "web_extract",
             "todo",
+            "voice_call",
+            "realtime",
+            "/voice/stream",
+            "/voice/webhook",
         )
         collected: list[dict[str, object]] = []
         for path in _iter_log_files():
@@ -427,6 +441,8 @@ async def _main_async() -> int:
     public_app.router.add_get("/", proxy.health)
     public_app.router.add_get("/health", proxy.health)
     public_app.router.add_get(TRACE_SEARCH_PATH, proxy.trace_search)
+    public_app.router.add_get("/admin/voice-calls", proxy.admin_voice_calls)
+    public_app.router.add_get("/admin/voice-calls/{call_id}", proxy.admin_voice_call_status)
     public_app.router.add_route("*", webhook_path, proxy.proxy_telegram)
     public_app.router.add_post(proxy.voice.webhook_path, proxy.voice.handle_webhook)
     public_app.router.add_get(proxy.voice.stream_path, proxy.voice.handle_stream)
