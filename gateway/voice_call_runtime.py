@@ -633,12 +633,26 @@ class VoiceCallRuntime:
         realtime_ready = asyncio.Event()
         pending_audio: list[bytes] = []
         pending_audio_bytes = 0
+        vox_started = asyncio.Event()
+        initial_response_sent = False
         try:
             max_pending_audio_bytes = int(
                 os.environ.get("VOICE_CALL_REALTIME_AUDIO_BUFFER_BYTES", "80000")
             )
         except ValueError:
             max_pending_audio_bytes = 80000
+
+        async def maybe_start_initial_response() -> None:
+            nonlocal initial_response_sent
+            if initial_response_sent:
+                return
+            if not realtime_ready.is_set() or not vox_started.is_set():
+                return
+            if not _truthy(os.environ.get("VOICE_CALL_INITIAL_RESPONSE", "1")):
+                return
+            initial_response_sent = True
+            await realtime.create_initial_response()
+            logger.info("voice_call initial response requested call_id=%s", call.call_id)
 
         async def connect_realtime() -> None:
             nonlocal pending_audio, pending_audio_bytes
@@ -659,6 +673,7 @@ class VoiceCallRuntime:
             pending_audio_bytes = 0
             for chunk in buffered:
                 await realtime.send_audio(chunk)
+            await maybe_start_initial_response()
             logger.info(
                 "voice_call realtime connected call_id=%s provider=%s model=%s startup_ms=%.0f buffered_bytes=%s",
                 call.call_id,
@@ -708,6 +723,7 @@ class VoiceCallRuntime:
                     setattr(call, "_stream_sid", stream_sid)
                     call.status = "stream_connected"
                     self._mark_metric(call, "vox_start_received_at")
+                    vox_started.set()
                     call.touch()
                     await vox_ws.send_json(
                         {
@@ -731,6 +747,7 @@ class VoiceCallRuntime:
                         self._elapsed_ms(call, "vox_start_received_at", "vox_start_sent_at"),
                         realtime_ready.is_set(),
                     )
+                    await maybe_start_initial_response()
                     continue
                 if event_name == "media":
                     payload = ((event.get("media") or {}).get("payload") or "").strip()
@@ -1545,6 +1562,27 @@ class RealtimeVoiceBridge:
                     "audio": base64.b64encode(audio).decode("ascii"),
                 }
             )
+
+    async def create_initial_response(self) -> None:
+        if not self.ws or self.ws.closed:
+            return
+        instructions = (
+            "Скажи только первую короткую фразу звонка: поздоровайся и одним вопросом "
+            "озвучь задачу. Затем полностью остановись и жди ответа собеседника. "
+            "Не продолжай сценарий сам."
+        )
+        if self.provider == "xai":
+            await self.ws.send_json({"type": "response.create", "instructions": instructions})
+            return
+        await self.ws.send_json(
+            {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "audio"],
+                    "instructions": instructions,
+                },
+            }
+        )
 
     async def close(self) -> None:
         if self.reader_task:
