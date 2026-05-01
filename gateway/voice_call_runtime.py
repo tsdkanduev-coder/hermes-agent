@@ -21,7 +21,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -523,7 +523,9 @@ class VoiceCallRuntime:
     async def handle_control_history(self, request: web.Request) -> web.Response:
         session_key = request.query.get("session_key", "")
         user_id = request.query.get("user_id", "")
-        calls = list(self.calls.values())
+        calls_by_id = {call.call_id: call for call in self._load_persisted_calls()}
+        calls_by_id.update(self.calls)
+        calls = list(calls_by_id.values())
         if session_key:
             calls = [call for call in calls if call.session_key == session_key]
         elif user_id:
@@ -1184,6 +1186,21 @@ class VoiceCallRuntime:
         except Exception:
             pass
 
+    def _load_persisted_calls(self) -> list[CallRecord]:
+        if not self.storage_dir.exists():
+            return []
+        calls: list[CallRecord] = []
+        for path in self.storage_dir.glob("*/*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data.pop("stream_token", None)
+                call_fields = {field.name for field in fields(CallRecord)}
+                call = CallRecord(**{key: value for key, value in data.items() if key in call_fields})
+            except Exception:
+                continue
+            calls.append(call)
+        return calls
+
     def _add_transcript(
         self, call: CallRecord, role: str, text: str, *, source: str = "unknown"
     ) -> None:
@@ -1381,7 +1398,13 @@ class VoiceCallRuntime:
         return f"https://calendar.google.com/calendar/render?{urlencode(params)}"
 
     def _resolve_call(self, call_id: str) -> CallRecord | None:
-        return self.calls.get(call_id) or self.calls.get(self.calls_by_provider.get(call_id, ""))
+        call = self.calls.get(call_id) or self.calls.get(self.calls_by_provider.get(call_id, ""))
+        if call:
+            return call
+        for persisted in self._load_persisted_calls():
+            if persisted.call_id == call_id or persisted.provider_call_id == call_id:
+                return persisted
+        return None
 
     def _call_from_payload(self, payload: dict[str, Any], request: web.Request) -> CallRecord | None:
         call_id = self._pick(payload, "callId") or request.query.get("callId", "")
