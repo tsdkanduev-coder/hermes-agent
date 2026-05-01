@@ -2,7 +2,7 @@
 """
 Text-to-Speech Tool Module
 
-Supports seven TTS providers:
+Supports multiple TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
@@ -10,6 +10,7 @@ Supports seven TTS providers:
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
+- Sber SaluteSpeech TTS: Russian speech synthesis, needs SBER_SALUTE_AUTH_KEY
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -36,6 +37,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
@@ -111,6 +113,16 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_SBER_SALUTE_TTS_VOICE = "Nec_24000"
+DEFAULT_SBER_SALUTE_TTS_FORMAT = "opus"
+SBER_SALUTE_OAUTH_URL = os.getenv(
+    "SBER_SALUTE_OAUTH_URL",
+    "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+)
+SBER_SALUTE_SYNTH_URL = os.getenv(
+    "SBER_SALUTE_SYNTH_URL",
+    "https://smartspeech.sber.ru/rest/v1/text:synthesize",
+)
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -136,6 +148,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "minimax": 10000,     # https://platform.minimax.io/docs/api-reference/speech-t2a-http (sync)
     "mistral": 4000,      # conservative; no published per-request cap
     "gemini": 5000,       # Gemini TTS caps at ~8k input tokens / ~655s audio
+    "sber_salute": 4000,  # conservative for synchronous REST synthesis
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
@@ -221,7 +234,14 @@ def _load_tts_config() -> Dict[str, Any]:
 
 def _get_provider(tts_config: Dict[str, Any]) -> str:
     """Get the configured TTS provider name."""
-    return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+    env_provider = (
+        os.getenv("TTS_PROVIDER", "").strip()
+        or os.getenv("HERMES_TTS_PROVIDER", "").strip()
+    )
+    provider = (env_provider or tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+    if provider in {"sber", "salute"}:
+        return "sber_salute"
+    return provider
 
 
 # ===========================================================================
@@ -456,6 +476,141 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     with open(output_path, "wb") as f:
         f.write(response.content)
 
+    return output_path
+
+
+# ===========================================================================
+# Provider: Sber SaluteSpeech TTS
+# ===========================================================================
+
+_sber_tts_token: str = ""
+_sber_tts_token_scope: str = ""
+_sber_tts_token_expires_at = 0.0
+
+
+def _sber_salute_insecure() -> bool:
+    value = os.getenv("SBER_SALUTE_INSECURE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _sber_scope_candidates() -> list[str]:
+    scopes: list[str] = []
+    for scope in (
+        os.getenv("SBER_SALUTE_SCOPE", "").strip(),
+        "SALUTE_SPEECH_CORP",
+        "SALUTE_SPEECH_PERS",
+    ):
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _sber_salute_tts_format(tts_config: Dict[str, Any]) -> str:
+    cfg = tts_config.get("sber_salute", {}) if isinstance(tts_config.get("sber_salute"), dict) else {}
+    return str(
+        os.getenv("SBER_SALUTE_TTS_FORMAT", "").strip()
+        or cfg.get("format")
+        or DEFAULT_SBER_SALUTE_TTS_FORMAT
+    ).strip()
+
+
+def _sber_salute_tts_access_token() -> str:
+    """Resolve a Sber token for Telegram/voice-mode TTS."""
+    global _sber_tts_token, _sber_tts_token_scope, _sber_tts_token_expires_at
+
+    now = time.time()
+    if _sber_tts_token and _sber_tts_token_expires_at - 60 > now:
+        return _sber_tts_token
+
+    auth_key = os.getenv("SBER_SALUTE_AUTH_KEY", "").strip()
+    if not auth_key:
+        raise ValueError("SBER_SALUTE_AUTH_KEY not set")
+
+    import requests
+
+    last_error = ""
+    payload: Dict[str, Any] = {}
+    for scope in _sber_scope_candidates():
+        response = requests.post(
+            SBER_SALUTE_OAUTH_URL,
+            data={"scope": scope},
+            headers={
+                "Authorization": f"Basic {auth_key}",
+                "RqUID": str(uuid.uuid4()),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
+            verify=not _sber_salute_insecure(),
+        )
+        if response.status_code < 400:
+            payload = response.json()
+            _sber_tts_token_scope = scope
+            break
+        last_error = f"Sber OAuth HTTP {response.status_code}: {response.text[:300]}"
+    else:
+        raise RuntimeError(last_error or "Sber OAuth failed")
+
+    token = str(payload.get("access_token") or payload.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("Sber OAuth response has no access_token")
+
+    expires_at = payload.get("expires_at") or payload.get("expiresAt") or 0
+    try:
+        expires_at_float = float(expires_at)
+        if expires_at_float > 10_000_000_000:
+            expires_at_float /= 1000.0
+    except (TypeError, ValueError):
+        expires_at_float = now + 1500
+
+    _sber_tts_token = token
+    _sber_tts_token_expires_at = expires_at_float
+    return _sber_tts_token
+
+
+def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech via Sber SaluteSpeech REST TTS."""
+    cfg = tts_config.get("sber_salute", {}) if isinstance(tts_config.get("sber_salute"), dict) else {}
+    voice = str(
+        os.getenv("SBER_SALUTE_TTS_VOICE", "").strip()
+        or cfg.get("voice")
+        or DEFAULT_SBER_SALUTE_TTS_VOICE
+    ).strip()
+    audio_format = _sber_salute_tts_format(tts_config)
+    content_type = str(
+        os.getenv("SBER_SALUTE_TTS_CONTENT_TYPE", "").strip()
+        or cfg.get("content_type")
+        or "application/ssml"
+    ).strip()
+
+    params: Dict[str, str] = {"format": audio_format}
+    if voice:
+        params["voice"] = voice
+
+    import requests
+
+    response = requests.post(
+        SBER_SALUTE_SYNTH_URL,
+        params=params,
+        data=text.encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_sber_salute_tts_access_token()}",
+            "Content-Type": content_type,
+            "Accept": "audio/ogg;codecs=opus" if audio_format == "opus" else "audio/*",
+        },
+        timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
+        verify=not _sber_salute_insecure(),
+    )
+    if response.status_code >= 400:
+        raise ValueError(f"Sber SaluteSpeech TTS HTTP {response.status_code}: {response.text[:300]}")
+
+    Path(output_path).write_bytes(response.content)
+    logger.info(
+        "Generated speech with Sber SaluteSpeech (voice=%s, format=%s, scope=%s)",
+        voice,
+        audio_format,
+        _sber_tts_token_scope or "unknown",
+    )
     return output_path
 
 
@@ -962,14 +1117,23 @@ def text_to_speech_tool(
     # Determine output path
     if output_path:
         file_path = Path(output_path).expanduser()
+        if provider == "sber_salute":
+            audio_format = _sber_salute_tts_format(tts_config)
+            desired_ext = ".ogg" if audio_format == "opus" else ".wav"
+            if file_path.suffix.lower() != desired_ext:
+                file_path = file_path.with_suffix(desired_ext)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = Path(DEFAULT_OUTPUT_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini"):
+        if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini", "sber_salute"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
+        elif provider == "sber_salute":
+            audio_format = _sber_salute_tts_format(tts_config)
+            suffix = "ogg" if audio_format == "opus" else "wav"
+            file_path = out_dir / f"tts_{timestamp}.{suffix}"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
 
@@ -1008,6 +1172,10 @@ def text_to_speech_tool(
         elif provider == "xai":
             logger.info("Generating speech with xAI TTS...")
             _generate_xai_tts(text, file_str, tts_config)
+
+        elif provider == "sber_salute":
+            logger.info("Generating speech with Sber SaluteSpeech TTS...")
+            _generate_sber_salute_tts(text, file_str, tts_config)
 
         elif provider == "mistral":
             try:
@@ -1092,7 +1260,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai", "mistral", "gemini"):
+        elif provider in ("elevenlabs", "openai", "mistral", "gemini", "sber_salute"):
             voice_compatible = file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
@@ -1163,6 +1331,8 @@ def check_tts_requirements() -> bool:
     if os.getenv("XAI_API_KEY"):
         return True
     if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        return True
+    if os.getenv("SBER_SALUTE_AUTH_KEY"):
         return True
     try:
         _import_mistral_client()

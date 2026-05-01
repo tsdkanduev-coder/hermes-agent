@@ -228,7 +228,7 @@ class SaluteSpeechTranscriber:
 
     def __init__(self) -> None:
         self.auth_key = os.environ.get("SBER_SALUTE_AUTH_KEY", "").strip()
-        self.scope = os.environ.get("SBER_SALUTE_SCOPE", "SALUTE_SPEECH_PERS").strip()
+        self.scope = os.environ.get("SBER_SALUTE_SCOPE", "SALUTE_SPEECH_CORP").strip()
         self.oauth_url = os.environ.get(
             "SBER_SALUTE_OAUTH_URL",
             "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
@@ -299,21 +299,32 @@ class SaluteSpeechTranscriber:
             return self._token
         timeout = aiohttp.ClientTimeout(total=float(os.environ.get("SBER_SALUTE_TIMEOUT", "60")))
         ssl_arg = False if self.insecure else None
+        scopes = []
+        for scope in (self.scope, "SALUTE_SPEECH_CORP", "SALUTE_SPEECH_PERS"):
+            if scope and scope not in scopes:
+                scopes.append(scope)
+        last_error = ""
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                self.oauth_url,
-                data={"scope": self.scope},
-                headers={
-                    "Authorization": f"Basic {self.auth_key}",
-                    "RqUID": str(uuid.uuid4()),
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                },
-                ssl=ssl_arg,
-            ) as response:
-                payload_text = await response.text()
-                if response.status >= 400:
-                    raise RuntimeError(f"Sber OAuth HTTP {response.status}: {payload_text[:300]}")
+            payload_text = ""
+            for scope in scopes:
+                async with session.post(
+                    self.oauth_url,
+                    data={"scope": scope},
+                    headers={
+                        "Authorization": f"Basic {self.auth_key}",
+                        "RqUID": str(uuid.uuid4()),
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "application/json",
+                    },
+                    ssl=ssl_arg,
+                ) as response:
+                    payload_text = await response.text()
+                    if response.status < 400:
+                        self.scope = scope
+                        break
+                    last_error = f"Sber OAuth HTTP {response.status}: {payload_text[:300]}"
+            else:
+                raise RuntimeError(last_error or "Sber OAuth failed")
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:

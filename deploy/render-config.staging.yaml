@@ -11,6 +11,19 @@ cron:
 web:
   backend: firecrawl
 
+stt:
+  enabled: true
+  provider: sber_salute
+  sber_salute:
+    model: general
+
+tts:
+  provider: sber_salute
+  sber_salute:
+    voice: Nec_24000
+    format: opus
+    content_type: application/ssml
+
 display:
   tool_progress: off
   technical_notices: off

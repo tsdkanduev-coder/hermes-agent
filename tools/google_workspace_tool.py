@@ -15,7 +15,8 @@ GOOGLE_WORKSPACE_SCHEMA = {
     "description": (
         "Connect and read the user's Google Workspace via per-user OAuth. "
         "Use for Google Mail/Gmail and Google Docs access. This version is read-only: "
-        "search/read Gmail, search/read Google Docs, and check connection status. "
+        "search/read Gmail, read supported Gmail attachments, search/read Google Docs, "
+        "and check connection status. "
         "Do not claim to send email, modify labels, create documents, or edit documents."
     ),
     "parameters": {
@@ -29,6 +30,7 @@ GOOGLE_WORKSPACE_SCHEMA = {
                     "disconnect",
                     "gmail_search",
                     "gmail_get",
+                    "gmail_attachment_get",
                     "docs_search",
                     "docs_get",
                 ],
@@ -43,7 +45,15 @@ GOOGLE_WORKSPACE_SCHEMA = {
             },
             "message_id": {
                 "type": "string",
-                "description": "Gmail message id returned by gmail_search.",
+                "description": "Gmail message id returned by gmail_search. Required for gmail_get and gmail_attachment_get.",
+            },
+            "attachment_id": {
+                "type": "string",
+                "description": "Gmail attachment id returned by gmail_get. Use with gmail_attachment_get.",
+            },
+            "filename": {
+                "type": "string",
+                "description": "Attachment filename returned by gmail_get. Alternative to attachment_id for gmail_attachment_get.",
             },
             "doc_id": {
                 "type": "string",
@@ -104,7 +114,7 @@ def _session_payload() -> dict[str, str]:
 
 def _request_payload(args: dict) -> dict:
     payload = _session_payload()
-    for key in ("query", "message_id", "doc_id", "max_results"):
+    for key in ("query", "message_id", "attachment_id", "filename", "doc_id", "max_results"):
         if args.get(key) not in (None, ""):
             payload[key] = args[key]
     return payload
@@ -150,6 +160,12 @@ def google_workspace_tool(args: dict) -> str:
     if action == "gmail_get":
         return json.dumps(
             _http_json("POST", _control_url("/gmail/get"), _request_payload(args)),
+            ensure_ascii=False,
+        )
+
+    if action == "gmail_attachment_get":
+        return json.dumps(
+            _http_json("POST", _control_url("/gmail/attachment"), _request_payload(args)),
             ensure_ascii=False,
         )
 

@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with seven providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -11,6 +11,8 @@ Provides speech-to-text transcription with six providers:
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
+  - **sber_salute** — Sber SaluteSpeech REST API, requires
+    ``SBER_SALUTE_AUTH_KEY``. Useful for Russian Telegram voice messages.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -26,12 +28,15 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -70,6 +75,7 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_SBER_SALUTE_STT_MODEL = os.getenv("SBER_SALUTE_RECOGNITION_MODEL", "general")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -77,6 +83,14 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+SBER_SALUTE_OAUTH_URL = os.getenv(
+    "SBER_SALUTE_OAUTH_URL",
+    "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+)
+SBER_SALUTE_RECOGNIZE_URL = os.getenv(
+    "SBER_SALUTE_RECOGNIZE_URL",
+    "https://smartspeech.sber.ru/rest/v1/speech:recognize",
+)
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
@@ -89,6 +103,9 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+_sber_token: str = ""
+_sber_token_scope: str = ""
+_sber_token_expires_at = 0.0
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -193,8 +210,12 @@ def _get_provider(stt_config: dict) -> str:
     if not is_stt_enabled(stt_config):
         return "none"
 
-    explicit = "provider" in stt_config
-    provider = stt_config.get("provider", DEFAULT_PROVIDER)
+    env_provider = (
+        os.getenv("STT_PROVIDER", "").strip()
+        or os.getenv("HERMES_STT_PROVIDER", "").strip()
+    )
+    explicit = bool(env_provider) or "provider" in stt_config
+    provider = (env_provider or stt_config.get("provider", DEFAULT_PROVIDER)).lower().strip()
 
     # --- Explicit provider: respect the user's choice ----------------------
 
@@ -254,14 +275,25 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider in {"sber", "sber_salute", "salute"}:
+            if os.getenv("SBER_SALUTE_AUTH_KEY"):
+                return "sber_salute"
+            logger.warning(
+                "STT provider 'sber_salute' configured but SBER_SALUTE_AUTH_KEY not set"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > mistral > xai -
+    # --- Auto-detect (no explicit provider): local > Sber > groq > openai > mistral > xai -
 
     if _HAS_FASTER_WHISPER:
         return "local"
     if _has_local_command():
         return "local_command"
+    if os.getenv("SBER_SALUTE_AUTH_KEY"):
+        logger.info("No local STT available, using Sber SaluteSpeech")
+        return "sber_salute"
     if _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
         logger.info("No local STT available, using Groq Whisper API")
         return "groq"
@@ -688,6 +720,227 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: Sber SaluteSpeech
+# ---------------------------------------------------------------------------
+
+
+def _sber_scope_candidates() -> list[str]:
+    scopes: list[str] = []
+    for scope in (
+        os.getenv("SBER_SALUTE_SCOPE", "").strip(),
+        "SALUTE_SPEECH_CORP",
+        "SALUTE_SPEECH_PERS",
+    ):
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _sber_salute_insecure() -> bool:
+    return is_truthy_value(os.getenv("SBER_SALUTE_INSECURE"), default=False)
+
+
+def _sber_salute_access_token() -> str:
+    """Resolve a Sber SaluteSpeech token for Telegram voice-message STT."""
+    global _sber_token, _sber_token_scope, _sber_token_expires_at
+
+    now = time.time()
+    if _sber_token and _sber_token_expires_at - 60 > now:
+        return _sber_token
+
+    auth_key = os.getenv("SBER_SALUTE_AUTH_KEY", "").strip()
+    if not auth_key:
+        raise ValueError("SBER_SALUTE_AUTH_KEY not set")
+
+    import requests
+
+    timeout = float(os.getenv("SBER_SALUTE_TIMEOUT", "60"))
+    verify = not _sber_salute_insecure()
+    last_error = ""
+    payload: dict[str, Any] = {}
+    for scope in _sber_scope_candidates():
+        response = requests.post(
+            SBER_SALUTE_OAUTH_URL,
+            data={"scope": scope},
+            headers={
+                "Authorization": f"Basic {auth_key}",
+                "RqUID": str(uuid.uuid4()),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=timeout,
+            verify=verify,
+        )
+        if response.status_code < 400:
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Sber OAuth returned non-JSON response: {response.text[:120]}"
+                ) from exc
+            _sber_token_scope = scope
+            break
+        last_error = f"Sber OAuth HTTP {response.status_code}: {response.text[:300]}"
+    else:
+        raise RuntimeError(last_error or "Sber OAuth failed")
+
+    token = str(payload.get("access_token") or payload.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("Sber OAuth response has no access_token")
+
+    expires_at = payload.get("expires_at") or payload.get("expiresAt") or 0
+    try:
+        expires_at_float = float(expires_at)
+        if expires_at_float > 10_000_000_000:
+            expires_at_float /= 1000.0
+    except (TypeError, ValueError):
+        expires_at_float = now + 1500
+
+    _sber_token = token
+    _sber_token_expires_at = expires_at_float
+    return _sber_token
+
+
+def _prepare_sber_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Prepare a user voice-message file for Sber SaluteSpeech REST STT."""
+    audio_path = Path(file_path)
+    suffix = audio_path.suffix.lower()
+    if suffix in {".ogg", ".oga"}:
+        return file_path, "audio/ogg;codecs=opus", None
+    if suffix == ".wav":
+        return file_path, "audio/x-wav", None
+
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return None, None, "Sber SaluteSpeech STT needs OGG Opus/WAV input or ffmpeg conversion"
+
+    converted_path = os.path.join(work_dir, f"{audio_path.stem}.ogg")
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        file_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        converted_path,
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        return converted_path, "audio/ogg;codecs=opus", None
+    except subprocess.CalledProcessError as exc:
+        details = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        logger.error("ffmpeg conversion for Sber STT failed for %s: %s", file_path, details)
+        return None, None, f"Failed to convert audio for Sber SaluteSpeech: {details}"
+
+
+def _extract_sber_transcript(payload_text: str) -> str:
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return payload_text.strip()
+
+    found: list[str] = []
+
+    def collect(value: Any, parent_key: str = "") -> None:
+        if isinstance(value, str):
+            if parent_key in {"result", "text", "transcript", "normalized_text", "normalizedText"}:
+                text = value.strip()
+                if text and text not in found:
+                    found.append(text)
+            return
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text and text not in found:
+                        found.append(text)
+                else:
+                    collect(item, parent_key)
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                collect(child, str(key))
+
+    collect(payload)
+    return " ".join(found).strip()
+
+
+def _transcribe_sber_salute(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe Telegram/short voice-message audio via Sber SaluteSpeech."""
+    if not os.getenv("SBER_SALUTE_AUTH_KEY", "").strip():
+        return {"success": False, "transcript": "", "error": "SBER_SALUTE_AUTH_KEY not set"}
+
+    try:
+        import requests
+
+        with tempfile.TemporaryDirectory(prefix="hermes-sber-stt-") as work_dir:
+            prepared, content_type, prep_error = _prepare_sber_audio(file_path, work_dir)
+            if prep_error:
+                return {"success": False, "transcript": "", "error": prep_error}
+            if not prepared or not content_type:
+                return {"success": False, "transcript": "", "error": "Unable to prepare audio for Sber STT"}
+
+            content_type = (
+                os.getenv("SBER_SALUTE_STT_CONTENT_TYPE", "").strip()
+                or os.getenv("SBER_SALUTE_TELEGRAM_CONTENT_TYPE", "").strip()
+                or content_type
+            )
+            token = _sber_salute_access_token()
+            params: dict[str, str] = {}
+            if model_name:
+                params["model"] = model_name
+
+            with open(prepared, "rb") as audio_file:
+                response = requests.post(
+                    SBER_SALUTE_RECOGNIZE_URL,
+                    params=params,
+                    data=audio_file,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": content_type,
+                        "Accept": "application/json",
+                    },
+                    timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
+                    verify=not _sber_salute_insecure(),
+                )
+
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"Sber SaluteSpeech HTTP {response.status_code}: {response.text[:300]}",
+            }
+
+        transcript_text = _extract_sber_transcript(response.text)
+        if not transcript_text:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Sber SaluteSpeech returned empty transcript",
+            }
+
+        logger.info(
+            "Transcribed %s via Sber SaluteSpeech (%s, scope=%s, %d chars)",
+            Path(file_path).name,
+            model_name,
+            _sber_token_scope or "unknown",
+            len(transcript_text),
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "sber_salute"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("Sber SaluteSpeech transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Sber SaluteSpeech failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -761,6 +1014,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "sber_salute":
+        sber_cfg = stt_config.get("sber_salute", {})
+        model_name = model or sber_cfg.get("model", DEFAULT_SBER_SALUTE_STT_MODEL)
+        return _transcribe_sber_salute(file_path, model_name)
+
     # No provider available
     return {
         "success": False,
@@ -769,8 +1027,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
+            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, set SBER_SALUTE_AUTH_KEY "
+            "for Sber SaluteSpeech, or set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY for "
+            "the OpenAI Whisper API."
         ),
     }
 

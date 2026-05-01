@@ -12,8 +12,10 @@ import os
 import re
 import secrets
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
@@ -29,6 +31,9 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
 GOOGLE_GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+GOOGLE_GMAIL_ATTACHMENTS_URL = (
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}"
+)
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_DOCS_DOCUMENT_URL = "https://docs.googleapis.com/v1/documents/{document_id}"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -194,6 +199,7 @@ class GoogleCalendarRuntime:
                 "calendar_read": _has_any_scope(scopes, CALENDAR_READ_SCOPES),
                 "calendar_write": _has_any_scope(scopes, CALENDAR_WRITE_SCOPES),
                 "gmail_read": "https://www.googleapis.com/auth/gmail.readonly" in scopes,
+                "gmail_attachments_read": "https://www.googleapis.com/auth/gmail.readonly" in scopes,
                 "drive_read": "https://www.googleapis.com/auth/drive.readonly" in scopes,
                 "docs_read": "https://www.googleapis.com/auth/documents.readonly" in scopes,
             },
@@ -342,6 +348,36 @@ class GoogleCalendarRuntime:
             )
         message = await self._gmail_get(token, message_id)
         return web.json_response({"success": True, "connected": True, "message": message})
+
+    async def handle_workspace_gmail_attachment_get(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        user_id = str(data.get("user_id") or "").strip()
+        message_id = str(data.get("message_id") or "").strip()
+        attachment_id = str(data.get("attachment_id") or "").strip()
+        filename = str(data.get("filename") or "").strip()
+        if not message_id:
+            return web.json_response(
+                {"success": False, "error": "message_id is required"},
+                status=400,
+            )
+        if not attachment_id and not filename:
+            return web.json_response(
+                {"success": False, "error": "attachment_id or filename is required"},
+                status=400,
+            )
+        token = await self._valid_access_token(user_id)
+        if not token:
+            return web.json_response(
+                {"success": False, "error": "google workspace is not connected", "connected": False},
+                status=401,
+            )
+        attachment = await self._gmail_attachment_get(
+            token,
+            message_id,
+            attachment_id=attachment_id,
+            filename=filename,
+        )
+        return web.json_response({"success": True, "connected": True, "attachment": attachment})
 
     async def handle_workspace_docs_search(self, request: web.Request) -> web.Response:
         data = await request.json()
@@ -835,6 +871,7 @@ class GoogleCalendarRuntime:
             params={"format": "full"},
         )
         headers = self._gmail_headers(message)
+        attachments = await self._gmail_attachment_summaries(access_token, message)
         return {
             "id": message.get("id", ""),
             "threadId": message.get("threadId", ""),
@@ -845,7 +882,125 @@ class GoogleCalendarRuntime:
             "labels": message.get("labelIds", []),
             "snippet": message.get("snippet", ""),
             "body": self._truncate_text(self._extract_gmail_body(message), 20000),
+            "attachments": attachments,
         }
+
+    async def _gmail_attachment_get(
+        self,
+        access_token: str,
+        message_id: str,
+        *,
+        attachment_id: str = "",
+        filename: str = "",
+    ) -> dict[str, Any]:
+        message = await self._google_get_json(
+            access_token,
+            f"{GOOGLE_GMAIL_MESSAGES_URL}/{quote(message_id, safe='')}",
+            params={"format": "full"},
+        )
+        target: dict[str, Any] | None = None
+        normalized_filename = filename.strip().lower()
+        for part in self._iter_gmail_parts(message.get("payload") or {}):
+            part_filename = str(part.get("filename") or "").strip()
+            body = part.get("body") or {}
+            part_attachment_id = str(body.get("attachmentId") or "").strip()
+            if attachment_id and part_attachment_id == attachment_id:
+                target = part
+                break
+            if normalized_filename and part_filename.lower() == normalized_filename:
+                target = part
+                break
+        if not target:
+            raise web.HTTPNotFound(
+                text=json.dumps(
+                    {"success": False, "error": "attachment not found"},
+                    ensure_ascii=False,
+                )
+            )
+
+        raw = await self._gmail_part_bytes(access_token, message_id, target)
+        filename = str(target.get("filename") or filename or "attachment")
+        mime_type = str(target.get("mimeType") or "application/octet-stream")
+        extraction = self._extract_attachment_text(filename, mime_type, raw)
+        return {
+            "message_id": message_id,
+            "attachment_id": str((target.get("body") or {}).get("attachmentId") or ""),
+            "filename": filename,
+            "mimeType": mime_type,
+            "size": len(raw),
+            "text": self._truncate_text(extraction.get("text", ""), 50000),
+            "extraction_status": extraction.get("status", "unknown"),
+        }
+
+    async def _gmail_attachment_summaries(
+        self,
+        access_token: str,
+        message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        message_id = str(message.get("id") or "")
+        max_preview_bytes = int(
+            os.environ.get("GOOGLE_WORKSPACE_ATTACHMENT_PREVIEW_MAX_BYTES", "1048576")
+        )
+        max_previews = int(os.environ.get("GOOGLE_WORKSPACE_ATTACHMENT_PREVIEW_COUNT", "5"))
+        attachments: list[dict[str, Any]] = []
+        previews_used = 0
+        for part in self._iter_gmail_parts(message.get("payload") or {}):
+            filename = str(part.get("filename") or "").strip()
+            body = part.get("body") or {}
+            attachment_id = str(body.get("attachmentId") or "").strip()
+            inline_data = body.get("data")
+            if not filename and not attachment_id:
+                continue
+            mime_type = str(part.get("mimeType") or "application/octet-stream")
+            size = int(body.get("size") or 0)
+            item: dict[str, Any] = {
+                "filename": filename or "(inline attachment)",
+                "mimeType": mime_type,
+                "attachment_id": attachment_id,
+                "size": size,
+                "has_text_preview": False,
+            }
+            should_preview = previews_used < max_previews and (
+                size <= max_preview_bytes or bool(inline_data)
+            )
+            if should_preview:
+                try:
+                    raw = await self._gmail_part_bytes(access_token, message_id, part)
+                    extraction = self._extract_attachment_text(filename, mime_type, raw)
+                    preview = extraction.get("text", "")
+                    if preview:
+                        item["text_preview"] = self._truncate_text(preview, 12000)
+                        item["has_text_preview"] = True
+                    item["extraction_status"] = extraction.get("status", "unknown")
+                    previews_used += 1
+                except Exception as exc:
+                    item["extraction_status"] = f"preview_failed: {type(exc).__name__}"
+            elif size > max_preview_bytes:
+                item["extraction_status"] = "too_large_for_auto_preview"
+            attachments.append(item)
+        return attachments
+
+    async def _gmail_part_bytes(
+        self,
+        access_token: str,
+        message_id: str,
+        part: dict[str, Any],
+    ) -> bytes:
+        body = part.get("body") or {}
+        data = body.get("data")
+        if data:
+            return self._decode_b64url_bytes(str(data))
+        attachment_id = str(body.get("attachmentId") or "").strip()
+        if not attachment_id:
+            return b""
+        payload = await self._google_get_json(
+            access_token,
+            GOOGLE_GMAIL_ATTACHMENTS_URL.format(
+                message_id=quote(message_id, safe=""),
+                attachment_id=quote(attachment_id, safe=""),
+            ),
+        )
+        return self._decode_b64url_bytes(str(payload.get("data") or ""))
 
     async def _docs_search(
         self,
@@ -959,7 +1114,7 @@ class GoogleCalendarRuntime:
         if product == "workspace":
             return (
                 "Google Workspace подключён. Теперь могу искать и читать письма, "
-                "Google Docs, календарь и добавлять встречи по вашему запросу."
+                "вложения в письмах, Google Docs, календарь и добавлять встречи по вашему запросу."
             )
         return "Календарь подключён. Теперь могу смотреть расписание, искать свободные окна и добавлять встречи."
 
@@ -1019,14 +1174,27 @@ class GoogleCalendarRuntime:
                 return found
         return ""
 
+    @classmethod
+    def _iter_gmail_parts(cls, part: dict[str, Any]):
+        yield part
+        for child in part.get("parts") or []:
+            yield from cls._iter_gmail_parts(child)
+
     @staticmethod
     def _decode_b64url(value: str) -> str:
-        padded = value + "=" * (-len(value) % 4)
         try:
-            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+            raw = GoogleCalendarRuntime._decode_b64url_bytes(value)
             return raw.decode("utf-8", errors="replace")
         except Exception:
             return ""
+
+    @staticmethod
+    def _decode_b64url_bytes(value: str) -> bytes:
+        padded = value + "=" * (-len(value) % 4)
+        try:
+            return base64.urlsafe_b64decode(padded.encode("ascii"))
+        except Exception:
+            return b""
 
     @staticmethod
     def _html_to_text(value: str) -> str:
@@ -1037,6 +1205,58 @@ class GoogleCalendarRuntime:
         text = html.unescape(text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+    @classmethod
+    def _extract_attachment_text(cls, filename: str, mime_type: str, raw: bytes) -> dict[str, str]:
+        if not raw:
+            return {"text": "", "status": "empty"}
+        name = filename.lower()
+        mime = mime_type.lower()
+        if mime == "text/html" or name.endswith((".html", ".htm")):
+            text = raw.decode("utf-8", errors="replace")
+            return {"text": cls._html_to_text(text), "status": "ok"}
+        if mime.startswith("text/") or name.endswith((".txt", ".csv", ".md", ".json", ".xml")):
+            text = raw.decode("utf-8", errors="replace")
+            return {"text": text.strip(), "status": "ok"}
+        if name.endswith(".docx") or mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            text = cls._extract_docx_text(raw)
+            return {"text": text, "status": "ok" if text else "empty_docx_text"}
+        if name.endswith(".pdf") or mime == "application/pdf":
+            text = cls._extract_pdf_text(raw)
+            return {"text": text, "status": "ok" if text else "pdf_text_unavailable"}
+        return {"text": "", "status": "unsupported_type"}
+
+    @staticmethod
+    def _extract_docx_text(raw: bytes) -> str:
+        try:
+            with zipfile.ZipFile(BytesIO(raw)) as archive:
+                document = archive.read("word/document.xml").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+        text = re.sub(r"<[^>]+>", " ", document)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def _extract_pdf_text(raw: bytes) -> str:
+        try:
+            from pypdf import PdfReader
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader  # type: ignore
+            except Exception:
+                return ""
+        try:
+            reader = PdfReader(BytesIO(raw))
+            pages = []
+            for page in reader.pages[:25]:
+                text = page.extract_text() or ""
+                if text.strip():
+                    pages.append(text.strip())
+            return "\n\n".join(pages).strip()
+        except Exception:
+            return ""
 
     @classmethod
     def _extract_doc_text(cls, node: Any) -> str:

@@ -448,6 +448,10 @@ async def _main_async() -> int:
     control_app.router.add_post("/workspace/disconnect", proxy.calendar.handle_control_disconnect)
     control_app.router.add_post("/workspace/gmail/search", proxy.calendar.handle_workspace_gmail_search)
     control_app.router.add_post("/workspace/gmail/get", proxy.calendar.handle_workspace_gmail_get)
+    control_app.router.add_post(
+        "/workspace/gmail/attachment",
+        proxy.calendar.handle_workspace_gmail_attachment_get,
+    )
     control_app.router.add_post("/workspace/docs/search", proxy.calendar.handle_workspace_docs_search)
     control_app.router.add_post("/workspace/docs/get", proxy.calendar.handle_workspace_docs_get)
 
