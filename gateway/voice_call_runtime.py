@@ -125,7 +125,10 @@ class CallRecord:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     ended_at: float | None = None
-    transcript: list[dict[str, str]] = field(default_factory=list)
+    transcript: list[dict[str, Any]] = field(default_factory=list)
+    raw_transcript: list[dict[str, Any]] = field(default_factory=list)
+    transcript_source: str = ""
+    metrics: dict[str, float] = field(default_factory=dict)
     summary_sent: bool = False
     summary_suppressed: bool = False
 
@@ -202,6 +205,172 @@ def _voice_realtime_voice(provider: str) -> str:
     return os.environ.get("VOICE_CALL_ASSISTANT_VOICE", default).strip() or default
 
 
+def _voice_vad_eagerness() -> str:
+    raw = os.environ.get("VOICE_CALL_VAD_EAGERNESS", "low").strip().lower()
+    return raw if raw in {"low", "medium", "high", "auto"} else "low"
+
+
+def _voice_transcription_provider() -> str:
+    configured = os.environ.get("VOICE_CALL_TRANSCRIPTION_PROVIDER", "").strip().lower()
+    if configured:
+        return configured
+    if os.environ.get("SBER_SALUTE_AUTH_KEY", "").strip():
+        return "sber_salute"
+    return "realtime"
+
+
+def _voice_metric_now() -> float:
+    return time.time()
+
+
+class SaluteSpeechTranscriber:
+    """Post-call ASR for Russian phone audio using Sber SaluteSpeech."""
+
+    def __init__(self) -> None:
+        self.auth_key = os.environ.get("SBER_SALUTE_AUTH_KEY", "").strip()
+        self.scope = os.environ.get("SBER_SALUTE_SCOPE", "SALUTE_SPEECH_PERS").strip()
+        self.oauth_url = os.environ.get(
+            "SBER_SALUTE_OAUTH_URL",
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+        ).strip()
+        self.api_url = os.environ.get(
+            "SBER_SALUTE_RECOGNIZE_URL",
+            "https://smartspeech.sber.ru/rest/v1/speech:recognize",
+        ).strip()
+        self.model = os.environ.get("SBER_SALUTE_RECOGNITION_MODEL", "callcenter").strip()
+        self.content_type = os.environ.get(
+            "SBER_SALUTE_CONTENT_TYPE", "audio/pcmu;rate=8000"
+        ).strip()
+        self.insecure = _truthy(os.environ.get("SBER_SALUTE_INSECURE"))
+        self.enabled = bool(self.auth_key)
+        self._token: str = ""
+        self._token_expires_at = 0.0
+
+    async def transcribe_pcmu(self, audio: bytes) -> dict[str, Any]:
+        if not self.enabled:
+            return {"success": False, "transcript": "", "error": "SBER_SALUTE_AUTH_KEY not set"}
+        if not audio:
+            return {"success": False, "transcript": "", "error": "empty audio"}
+        try:
+            token = await self._access_token()
+            timeout = aiohttp.ClientTimeout(total=float(os.environ.get("SBER_SALUTE_TIMEOUT", "60")))
+            ssl_arg = False if self.insecure else None
+            params: dict[str, str] = {}
+            if self.model:
+                params["model"] = self.model
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    self.api_url,
+                    params=params,
+                    data=audio,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": self.content_type,
+                        "Accept": "application/json",
+                    },
+                    ssl=ssl_arg,
+                ) as response:
+                    text = await response.text()
+                    if response.status >= 400:
+                        return {
+                            "success": False,
+                            "transcript": "",
+                            "error": f"Sber SaluteSpeech HTTP {response.status}: {text[:300]}",
+                        }
+            transcript = self._extract_transcript(text)
+            if not transcript:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": "Sber SaluteSpeech returned empty transcript",
+                }
+            return {"success": True, "transcript": transcript, "provider": "sber_salute"}
+        except Exception as exc:
+            logger.exception("Sber SaluteSpeech transcription failed")
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"Sber SaluteSpeech failed: {exc}",
+            }
+
+    async def _access_token(self) -> str:
+        now = time.time()
+        if self._token and self._token_expires_at - 60 > now:
+            return self._token
+        timeout = aiohttp.ClientTimeout(total=float(os.environ.get("SBER_SALUTE_TIMEOUT", "60")))
+        ssl_arg = False if self.insecure else None
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                self.oauth_url,
+                data={"scope": self.scope},
+                headers={
+                    "Authorization": f"Basic {self.auth_key}",
+                    "RqUID": str(uuid.uuid4()),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                ssl=ssl_arg,
+            ) as response:
+                payload_text = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Sber OAuth HTTP {response.status}: {payload_text[:300]}")
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Sber OAuth returned non-JSON response: {payload_text[:120]}") from exc
+        token = str(payload.get("access_token") or payload.get("token") or "").strip()
+        if not token:
+            raise RuntimeError("Sber OAuth response has no access_token")
+        expires_at = payload.get("expires_at") or payload.get("expiresAt") or 0
+        try:
+            expires_at_float = float(expires_at)
+            if expires_at_float > 10_000_000_000:
+                expires_at_float /= 1000.0
+        except (TypeError, ValueError):
+            expires_at_float = now + 25 * 60
+        if expires_at_float <= now:
+            expires_at_float = now + 25 * 60
+        self._token = token
+        self._token_expires_at = expires_at_float
+        return token
+
+    @staticmethod
+    def _extract_transcript(payload_text: str) -> str:
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return payload_text.strip()
+        parts: list[str] = []
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(SaluteSpeechTranscriber._extract_from_dict(item))
+        elif isinstance(payload, dict):
+            parts.append(SaluteSpeechTranscriber._extract_from_dict(payload))
+        return " ".join(part.strip() for part in parts if part and part.strip()).strip()
+
+    @staticmethod
+    def _extract_from_dict(payload: dict[str, Any]) -> str:
+        for key in ("text", "transcript", "normalized_text", "normalizedText"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        result = payload.get("result") or payload.get("results")
+        if isinstance(result, str):
+            return result.strip()
+        if isinstance(result, list):
+            parts: list[str] = []
+            for item in result:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(SaluteSpeechTranscriber._extract_from_dict(item))
+            return " ".join(part.strip() for part in parts if part and part.strip()).strip()
+        return ""
+
+
 class VoiceCallRuntime:
     def __init__(self) -> None:
         self.calls: dict[str, CallRecord] = {}
@@ -221,6 +390,8 @@ class VoiceCallRuntime:
             "missing": required,
             "realtime_provider": realtime_provider,
             "realtime_model": _voice_realtime_model(realtime_provider),
+            "vad_eagerness": _voice_vad_eagerness(),
+            "transcription_provider": _voice_transcription_provider(),
             "public_origin": self.public_origin,
             "webhook_path": self.webhook_path,
             "stream_path": self.stream_path,
@@ -400,7 +571,7 @@ class VoiceCallRuntime:
 
         transcript = self._pick(payload, "transcript", "speech", "text")
         if transcript and event_type in {"call.speech", "speech", "transcript"}:
-            call.transcript.append({"role": "callee", "text": transcript})
+            self._add_transcript(call, "callee", transcript, source="voximplant_webhook")
 
         call.status = event_type or call.status
         call.touch()
@@ -429,6 +600,7 @@ class VoiceCallRuntime:
 
         vox_ws = web.WebSocketResponse(heartbeat=25)
         await vox_ws.prepare(request)
+        self._mark_metric(call, "stream_opened_at")
 
         realtime_provider = _voice_realtime_provider()
         realtime = RealtimeVoiceBridge(
@@ -440,25 +612,74 @@ class VoiceCallRuntime:
             language=call.language or "ru",
             call=call,
             on_assistant_audio=lambda audio: self._send_audio_to_vox(vox_ws, call, audio),
-            on_transcript=lambda role, text: self._add_transcript(call, role, text),
-        )
-        await realtime.connect()
-        call.status = "streaming"
-        call.touch()
-        self._persist(call)
-        logger.info(
-            "voice_call stream connected call_id=%s realtime_provider=%s model=%s",
-            call.call_id,
-            realtime_provider,
-            realtime.model,
+            on_transcript=lambda role, text: self._add_transcript(
+                call, role, text, source=f"{realtime_provider}_realtime"
+            ),
         )
 
         stream_sid = f"vox-{call.call_id}"
         seq = 0
+        realtime_ready = asyncio.Event()
+        pending_audio: list[bytes] = []
+        pending_audio_bytes = 0
+        try:
+            max_pending_audio_bytes = int(
+                os.environ.get("VOICE_CALL_REALTIME_AUDIO_BUFFER_BYTES", "80000")
+            )
+        except ValueError:
+            max_pending_audio_bytes = 80000
+
+        async def connect_realtime() -> None:
+            nonlocal pending_audio, pending_audio_bytes
+            self._mark_metric(call, "realtime_connect_started_at")
+            try:
+                await realtime.connect()
+            except Exception as exc:
+                call.error = f"realtime_connect_failed: {exc}"
+                call.status = "stream_error"
+                call.touch()
+                self._persist(call)
+                logger.exception("voice_call realtime connect failed call_id=%s", call.call_id)
+                return
+            self._mark_metric(call, "realtime_connected_at")
+            realtime_ready.set()
+            buffered = pending_audio
+            pending_audio = []
+            pending_audio_bytes = 0
+            for chunk in buffered:
+                await realtime.send_audio(chunk)
+            logger.info(
+                "voice_call realtime connected call_id=%s provider=%s model=%s startup_ms=%.0f buffered_bytes=%s",
+                call.call_id,
+                realtime_provider,
+                realtime.model,
+                self._elapsed_ms(call, "stream_opened_at", "realtime_connected_at"),
+                sum(len(chunk) for chunk in buffered),
+            )
+
+        async def forward_audio(audio: bytes) -> None:
+            nonlocal pending_audio_bytes
+            if not audio:
+                return
+            self._record_callee_audio(call, audio)
+            if "first_inbound_audio_at" not in call.metrics:
+                self._mark_metric(call, "first_inbound_audio_at")
+            if realtime_ready.is_set():
+                await realtime.send_audio(audio)
+                return
+            if max_pending_audio_bytes <= 0:
+                return
+            pending_audio.append(audio)
+            pending_audio_bytes += len(audio)
+            while pending_audio_bytes > max_pending_audio_bytes and pending_audio:
+                dropped = pending_audio.pop(0)
+                pending_audio_bytes -= len(dropped)
+
+        connect_task = asyncio.create_task(connect_realtime())
         try:
             async for msg in vox_ws:
                 if msg.type == WSMsgType.BINARY:
-                    await realtime.send_audio(msg.data)
+                    await forward_audio(msg.data)
                     continue
                 if msg.type != WSMsgType.TEXT:
                     continue
@@ -475,6 +696,7 @@ class VoiceCallRuntime:
                     )
                     setattr(call, "_stream_sid", stream_sid)
                     call.status = "stream_connected"
+                    self._mark_metric(call, "vox_start_received_at")
                     call.touch()
                     await vox_ws.send_json(
                         {
@@ -491,12 +713,19 @@ class VoiceCallRuntime:
                             "streamSid": stream_sid,
                         }
                     )
+                    self._mark_metric(call, "vox_start_sent_at")
+                    logger.info(
+                        "voice_call vox stream start call_id=%s ack_ms=%.0f realtime_ready=%s",
+                        call.call_id,
+                        self._elapsed_ms(call, "vox_start_received_at", "vox_start_sent_at"),
+                        realtime_ready.is_set(),
+                    )
                     continue
                 if event_name == "media":
                     payload = ((event.get("media") or {}).get("payload") or "").strip()
                     if payload:
                         try:
-                            await realtime.send_audio(base64.b64decode(payload))
+                            await forward_audio(base64.b64decode(payload))
                         except Exception:
                             pass
                     continue
@@ -504,6 +733,23 @@ class VoiceCallRuntime:
                     break
                 seq += 1
         finally:
+            if not connect_task.done():
+                connect_task.cancel()
+                try:
+                    await connect_task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    exc = connect_task.exception()
+                except asyncio.CancelledError:
+                    exc = None
+                if exc:
+                    logger.warning(
+                        "voice_call realtime task ended with error call_id=%s error=%s",
+                        call.call_id,
+                        exc,
+                    )
             await realtime.close()
             call.touch()
             self._persist(call)
@@ -515,6 +761,8 @@ class VoiceCallRuntime:
     ) -> None:
         if vox_ws.closed:
             return
+        if "first_assistant_audio_at" not in call.metrics:
+            self._mark_metric(call, "first_assistant_audio_at")
         stream_sid = getattr(call, "_stream_sid", f"vox-{call.call_id}")
         for offset in range(0, len(audio), 160):
             chunk = audio[offset : offset + 160]
@@ -535,6 +783,44 @@ class VoiceCallRuntime:
                     },
                 }
             )
+
+    # ------------------------------------------------------------------
+    # Metrics and audio capture
+    # ------------------------------------------------------------------
+
+    def _mark_metric(self, call: CallRecord, name: str) -> None:
+        call.metrics[name] = _voice_metric_now()
+        call.touch()
+        self._persist(call)
+
+    def _elapsed_ms(self, call: CallRecord, start_name: str, end_name: str) -> float:
+        start = call.metrics.get(start_name)
+        end = call.metrics.get(end_name)
+        if not start or not end:
+            return 0.0
+        return max((end - start) * 1000, 0.0)
+
+    def _record_callee_audio(self, call: CallRecord, audio: bytes) -> None:
+        chunks: list[bytes] = getattr(call, "_callee_audio_chunks", [])
+        total = int(getattr(call, "_callee_audio_bytes", 0))
+        try:
+            max_seconds = int(os.environ.get("VOICE_CALL_TRANSCRIPTION_MAX_SECONDS", "240"))
+        except ValueError:
+            max_seconds = 240
+        max_bytes = max(max_seconds, 15) * 8000
+        chunks.append(audio)
+        total += len(audio)
+        while total > max_bytes and chunks:
+            dropped = chunks.pop(0)
+            total -= len(dropped)
+        setattr(call, "_callee_audio_chunks", chunks)
+        setattr(call, "_callee_audio_bytes", total)
+
+    def _callee_audio_bytes(self, call: CallRecord) -> bytes:
+        chunks = getattr(call, "_callee_audio_chunks", [])
+        if not chunks:
+            return b""
+        return b"".join(chunks)
 
     # ------------------------------------------------------------------
     # Voximplant management
@@ -697,6 +983,7 @@ class VoiceCallRuntime:
                 (call.ended_at or time.time()) - call.created_at,
             )
             return
+        await self._maybe_apply_salute_transcript(call)
         text = await self._build_summary(call)
         await self._send_telegram(call.chat_id, text)
         call.summary_sent = True
@@ -724,10 +1011,71 @@ class VoiceCallRuntime:
         elapsed = (call.ended_at or time.time()) - call.created_at
         return elapsed > suppress_seconds
 
+    async def _maybe_apply_salute_transcript(self, call: CallRecord) -> None:
+        if _voice_transcription_provider() not in {"sber", "sber_salute", "salute"}:
+            return
+        if call.transcript_source == "sber_salute":
+            return
+        audio = self._callee_audio_bytes(call)
+        if not audio:
+            logger.info("voice_call salute transcript skipped call_id=%s reason=no_audio", call.call_id)
+            return
+        transcriber = SaluteSpeechTranscriber()
+        if not transcriber.enabled:
+            logger.info("voice_call salute transcript skipped call_id=%s reason=not_configured", call.call_id)
+            return
+        result = await transcriber.transcribe_pcmu(audio)
+        if not result.get("success"):
+            logger.warning(
+                "voice_call salute transcript failed call_id=%s error=%s",
+                call.call_id,
+                result.get("error"),
+            )
+            return
+        text = str(result.get("transcript") or "").strip()
+        if not text:
+            return
+        call.transcript = [
+            item
+            for item in call.transcript
+            if item.get("role") != "callee" or item.get("source") == "sber_salute"
+        ]
+        self._add_transcript(call, "callee", text, source="sber_salute")
+        call.transcript_source = "sber_salute"
+        call.touch()
+        self._persist(call)
+        logger.info(
+            "voice_call salute transcript applied call_id=%s chars=%s audio_bytes=%s",
+            call.call_id,
+            len(text),
+            len(audio),
+        )
+
     async def _build_summary(self, call: CallRecord) -> str:
-        transcript = "\n".join(
-            f"{item.get('role', 'unknown')}: {item.get('text', '')}" for item in call.transcript[-80:]
-        ).strip()
+        if call.transcript_source == "sber_salute":
+            callee_text = " ".join(
+                str(item.get("text") or "").strip()
+                for item in call.transcript
+                if item.get("role") == "callee" and item.get("source") == "sber_salute"
+            ).strip()
+            assistant_text = " ".join(
+                str(item.get("text") or "").strip()
+                for item in call.transcript[-80:]
+                if item.get("role") == "assistant"
+            ).strip()
+            transcript = "\n".join(
+                part
+                for part in (
+                    f"Собеседник (Sber SaluteSpeech): {callee_text}" if callee_text else "",
+                    f"Ассистент: {assistant_text}" if assistant_text else "",
+                )
+                if part
+            ).strip()
+        else:
+            transcript = "\n".join(
+                f"{item.get('role', 'unknown')}: {item.get('text', '')}"
+                for item in call.transcript[-80:]
+            ).strip()
         if not transcript:
             if "error" in call.status or "fail" in call.status:
                 return (
@@ -808,13 +1156,60 @@ class VoiceCallRuntime:
         except Exception:
             pass
 
-    def _add_transcript(self, call: CallRecord, role: str, text: str) -> None:
-        clean = text.strip()
-        if not clean:
+    def _add_transcript(
+        self, call: CallRecord, role: str, text: str, *, source: str = "unknown"
+    ) -> None:
+        raw = text.strip()
+        if not raw:
             return
-        call.transcript.append({"role": role, "text": clean})
+        call.raw_transcript.append(
+            {"role": role, "text": raw, "source": source, "timestamp": time.time()}
+        )
+        clean = self._clean_transcript_text(raw)
+        if not clean:
+            call.touch()
+            self._persist(call)
+            return
+        if call.transcript and call.transcript[-1].get("role") == role:
+            previous = str(call.transcript[-1].get("text") or "").strip().lower()
+            if previous == clean.lower():
+                call.touch()
+                self._persist(call)
+                return
+        if role == "callee" and "first_callee_transcript_at" not in call.metrics:
+            self._mark_metric(call, "first_callee_transcript_at")
+        if role == "assistant" and "first_assistant_transcript_at" not in call.metrics:
+            self._mark_metric(call, "first_assistant_transcript_at")
+        call.transcript.append(
+            {"role": role, "text": clean, "source": source, "timestamp": time.time()}
+        )
+        if source:
+            call.transcript_source = source
         call.touch()
         self._persist(call)
+
+    @staticmethod
+    def _clean_transcript_text(text: str) -> str:
+        clean = re.sub(r"\s+", " ", text).strip()
+        if not clean:
+            return ""
+        if re.fullmatch(r"[\W_]+", clean, flags=re.UNICODE):
+            return ""
+        if len(clean) <= 3 and not re.search(r"[A-Za-zА-Яа-яЁё0-9]", clean):
+            return ""
+        junk = clean.lower()
+        known_junk = {
+            "😎",
+            "🤖",
+            "♪",
+            "♫",
+            "music",
+            "субтитры сделал dima torzok",
+            "спасибо за просмотр",
+        }
+        if junk in known_junk:
+            return ""
+        return clean
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1003,7 +1398,9 @@ class VoiceCallRuntime:
                 "Контекст: прямо сейчас ты находишься в звонке с сотрудником ресторана, чтобы выполнить задачу ниже.",
                 f"Задача: {task}.",
                 "Тональность: говори коротко, по-русски, 1-2 предложения, веди разговор по-человечески, общайся вежливо, спокойно и по-деловому.",
-                "Внимательно слушай собеседника. Реагируй на то, что он говорит, а не на свои ожидания.",
+                "Внимательно слушай собеседника. Не перебивай: отвечай только после явной паузы или законченной реплики.",
+                "Если собеседник говорит 'алло', 'вас не слышно' или связь плохая — спокойно повтори одну короткую фразу и не продвигай сценарий дальше, пока тебя не услышали.",
+                "Реагируй на то, что сказал человек, а не на свои ожидания. Не перескакивай к следующему пункту, пока текущий вопрос не закрыт.",
                 "Начинай разговор с приветствия и озвучь свою задачу одной фразой. Не представляйся — говори как обычный человек по телефону.",
                 "Примеры как вести диалог:",
                 "Пример №1:",
@@ -1097,12 +1494,14 @@ class RealtimeVoiceBridge:
                     "input_audio_format": "g711_ulaw",
                     "output_audio_format": "g711_ulaw",
                     "input_audio_transcription": {
-                        "model": "whisper-1",
+                        "model": os.environ.get(
+                            "VOICE_CALL_REALTIME_TRANSCRIPTION_MODEL", "whisper-1"
+                        ),
                         "language": self.language or "ru",
                     },
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "high",
+                        "eagerness": _voice_vad_eagerness(),
                         "create_response": True,
                     },
                 },

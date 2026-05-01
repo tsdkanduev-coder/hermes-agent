@@ -5459,7 +5459,7 @@ class GatewayRunner:
 
         greeting = "Добрый день."
         if source.user_name:
-            greeting = f"{source.user_name}, добрый день."
+            greeting = f"{self._russian_greeting_name(source.user_name)}, добрый день."
 
         return (
             f"{greeting} Я Гига Помощник.\n\n"
@@ -5474,6 +5474,80 @@ class GatewayRunner:
             "Если понадобится календарь, почта или документы, пришлю безопасную ссылку "
             "для подключения Google-доступа."
         )
+
+    @staticmethod
+    def _russian_greeting_name(name: str) -> str:
+        """Return a short Russian-facing first name for Telegram greetings."""
+        clean = re.sub(r"\s+", " ", str(name or "")).strip()
+        if not clean:
+            return ""
+        first = clean.split(" ", 1)[0].strip(".,;:!?")
+        if re.search(r"[А-Яа-яЁё]", first):
+            return first
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'_-]{1,40}", first):
+            return first
+        return GatewayRunner._latin_name_to_cyrillic(first)
+
+    @staticmethod
+    def _latin_name_to_cyrillic(name: str) -> str:
+        mapping = (
+            ("shch", "щ"),
+            ("sch", "щ"),
+            ("yo", "ё"),
+            ("yu", "ю"),
+            ("ya", "я"),
+            ("ye", "е"),
+            ("zh", "ж"),
+            ("kh", "х"),
+            ("ch", "ч"),
+            ("sh", "ш"),
+            ("ts", "ц"),
+        )
+        single = {
+            "a": "а",
+            "b": "б",
+            "c": "к",
+            "d": "д",
+            "e": "е",
+            "f": "ф",
+            "g": "г",
+            "h": "х",
+            "i": "и",
+            "j": "дж",
+            "k": "к",
+            "l": "л",
+            "m": "м",
+            "n": "н",
+            "o": "о",
+            "p": "п",
+            "q": "к",
+            "r": "р",
+            "s": "с",
+            "t": "т",
+            "u": "у",
+            "v": "в",
+            "w": "в",
+            "x": "кс",
+            "y": "й",
+            "z": "з",
+        }
+        src = name.lower().replace("-", "").replace("_", "").replace("'", "")
+        out: list[str] = []
+        idx = 0
+        while idx < len(src):
+            matched = False
+            for latin, cyr in mapping:
+                if src.startswith(latin, idx):
+                    out.append(cyr)
+                    idx += len(latin)
+                    matched = True
+                    break
+            if matched:
+                continue
+            out.append(single.get(src[idx], src[idx]))
+            idx += 1
+        result = "".join(out).strip()
+        return result[:1].upper() + result[1:] if result else name
 
 
     async def _handle_help_command(self, event: MessageEvent) -> str:

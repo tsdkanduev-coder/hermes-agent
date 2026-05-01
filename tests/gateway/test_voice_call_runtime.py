@@ -1,0 +1,41 @@
+from gateway.voice_call_runtime import (
+    CallRecord,
+    SaluteSpeechTranscriber,
+    VoiceCallRuntime,
+)
+
+
+def test_voice_transcript_filters_realtime_junk(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runtime = VoiceCallRuntime()
+    call = CallRecord(call_id="call_test", to="+70000000000", task="Позвонить")
+
+    runtime._add_transcript(call, "callee", "😎", source="openai_realtime")
+    runtime._add_transcript(call, "callee", " Алло. ", source="openai_realtime")
+    runtime._add_transcript(call, "callee", "Алло.", source="openai_realtime")
+
+    assert len(call.raw_transcript) == 3
+    assert call.transcript == [
+        {
+            "role": "callee",
+            "text": "Алло.",
+            "source": "openai_realtime",
+            "timestamp": call.transcript[0]["timestamp"],
+        }
+    ]
+
+
+def test_salute_transcript_extractor_handles_common_payloads():
+    assert SaluteSpeechTranscriber._extract_transcript('{"result":["Алло, ресторан."]}') == (
+        "Алло, ресторан."
+    )
+    assert SaluteSpeechTranscriber._extract_transcript(
+        '{"results":[{"text":"Добрый день."},{"normalized_text":"Слушаю вас."}]}'
+    ) == "Добрый день. Слушаю вас."
+
+
+def test_russian_greeting_name_transliterates_first_latin_token():
+    from gateway.run import GatewayRunner
+
+    assert GatewayRunner._russian_greeting_name("Tsevdn Kanduev") == "Цевдн"
+    assert GatewayRunner._russian_greeting_name("Павел Богомолов") == "Павел"
