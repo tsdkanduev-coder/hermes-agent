@@ -113,7 +113,7 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_SBER_SALUTE_TTS_VOICE = "Erm-Freespeech_24000"
+DEFAULT_SBER_SALUTE_TTS_VOICE = "May_24000"
 DEFAULT_SBER_SALUTE_TTS_FORMAT = "opus"
 SBER_SALUTE_OAUTH_URL = os.getenv(
     "SBER_SALUTE_OAUTH_URL",
