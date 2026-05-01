@@ -20,7 +20,7 @@ stt:
 tts:
   provider: sber_salute
   sber_salute:
-    voice: Nec_24000
+    voice: Erm-Freespeech_24000
     format: opus
     content_type: application/ssml
 
