@@ -130,9 +130,11 @@ def google_workspace_tool(args: dict) -> str:
     if action == "connect":
         result = _http_json("POST", _control_url("/connect"), _session_payload())
         if result.get("success"):
+            result.pop("auth_url", None)
             result["assistant_instruction"] = (
-                "Send public_message verbatim as the whole user-facing reply. Do not add "
-                "OAuth implementation details, storage paths, tool names, or diagnostics."
+                "Send public_message verbatim as the whole user-facing reply. It contains a "
+                "Markdown link; do not expand it into a raw URL. Do not add OAuth "
+                "implementation details, storage paths, tool names, or diagnostics."
             )
         elif result.get("missing"):
             result["assistant_instruction"] = (

@@ -103,3 +103,15 @@ def test_attendees_from_value_filters_non_emails_and_deduplicates():
         {"email": "a@example.com", "displayName": "A"},
         {"email": "b@example.com"},
     ]
+
+
+def test_connect_public_message_uses_short_markdown_link():
+    runtime = GoogleCalendarRuntime.__new__(GoogleCalendarRuntime)
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&scope=calendar"
+
+    message = runtime._connect_public_message(auth_url, "workspace")
+
+    assert "[Открыть подключение Google](" in message
+    assert message.count(auth_url) == 1
+    assert f"доступ:\n{auth_url}" not in message
+    assert "Google Почту, Документы и календарь" in message

@@ -1097,15 +1097,15 @@ class GoogleCalendarRuntime:
         return slots
 
     def _connect_public_message(self, auth_url: str, product: str) -> str:
+        link = f"[Открыть подключение Google]({auth_url})"
         if product == "workspace":
             return (
-                "Чтобы подключить Google Почту, Документы и календарь, откройте ссылку и разрешите доступ:\n"
-                f"{auth_url}\n\n"
+                "Чтобы подключить Google Почту, Документы и календарь, "
+                f"нажмите: {link}\n\n"
                 "После подтверждения вернитесь в Telegram — сообщу, когда доступ подключится."
             )
         return (
-            "Чтобы подключить Google Calendar, откройте ссылку и разрешите доступ:\n"
-            f"{auth_url}\n\n"
+            f"Чтобы подключить Google Calendar, нажмите: {link}\n\n"
             "После подтверждения вернитесь в Telegram — сообщу, когда календарь подключится."
         )
 

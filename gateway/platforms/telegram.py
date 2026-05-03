@@ -94,6 +94,9 @@ def check_telegram_requirements() -> bool:
 # Matches every character that MarkdownV2 requires to be backslash-escaped
 # when it appears outside a code span or fenced code block.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
+_GOOGLE_OAUTH_RAW_URL_RE = re.compile(
+    r"(?<!\]\()https://accounts\.google\.com/o/oauth2/v2/auth\?\S+"
+)
 
 
 def _escape_mdv2(text: str) -> str:
@@ -119,6 +122,22 @@ def _strip_mdv2(text: str) -> str:
     # Remove MarkdownV2 spoiler markers (||text|| → text)
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
     return cleaned
+
+
+def _collapse_google_oauth_links(text: str) -> str:
+    """Hide long Google OAuth URLs behind a short Telegram-rendered link."""
+    if not text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        url = match.group(0)
+        trailing = ""
+        while url and url[-1] in ".,;":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        return f"[Открыть подключение Google]({url}){trailing}"
+
+    return _GOOGLE_OAUTH_RAW_URL_RE.sub(_replace, text)
 
 
 # ---------------------------------------------------------------------------
@@ -993,7 +1012,7 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             # Format and split message if needed
-            formatted = self.format_message(content)
+            formatted = self.format_message(_collapse_google_oauth_links(content))
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )

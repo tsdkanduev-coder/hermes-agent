@@ -36,6 +36,7 @@ _ensure_telegram_mock()
 
 from gateway.platforms.telegram import (  # noqa: E402
     TelegramAdapter,
+    _collapse_google_oauth_links,
     _escape_mdv2,
     _strip_mdv2,
     _wrap_markdown_tables,
@@ -274,6 +275,22 @@ class TestFormatMessageLinks:
         result = adapter.format_message("Visit [Google](https://google.com) today.")
         assert "[Google](https://google.com)" in result
         assert "today\\." in result
+
+
+class TestGoogleOAuthLinks:
+    def test_collapse_raw_google_oauth_link(self):
+        raw_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&scope=calendar"
+
+        result = _collapse_google_oauth_links(f"Откройте ссылку:\n{raw_url}\nГотово")
+
+        assert f"\n{raw_url}\n" not in result
+        assert f"[Открыть подключение Google]({raw_url})" in result
+
+    def test_does_not_rewrite_existing_markdown_google_oauth_link(self):
+        raw_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&scope=calendar"
+        text = f"[Открыть подключение Google]({raw_url})"
+
+        assert _collapse_google_oauth_links(text) == text
 
 
 # =========================================================================
