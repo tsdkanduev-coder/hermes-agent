@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -113,6 +113,15 @@ def _parse_log_timestamp(line: str) -> Optional[float]:
     raw = line[:23]
     try:
         return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S,%f").timestamp()
+    except Exception:
+        return None
+
+
+def _iso_timestamp(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
     except Exception:
         return None
 
@@ -310,6 +319,187 @@ class RenderProxy:
         finally:
             conn.close()
 
+    async def admin_usage_stats(self, request: web.Request) -> web.Response:
+        if not self._admin_authorized(request):
+            return web.json_response({"detail": "Not found"}, status=404)
+
+        source = request.query.get("source", "telegram").strip() or "telegram"
+        include_users = request.query.get("include_users", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        try:
+            user_limit = min(max(int(request.query.get("user_limit", "500")), 1), 5000)
+        except ValueError:
+            user_limit = 500
+
+        db_path = _hermes_home() / "state.db"
+        if not db_path.exists():
+            return web.json_response(
+                {"detail": "state.db not found", "path": str(db_path)}, status=404
+            )
+
+        start_predicate = """
+            m.role = 'user'
+            AND (
+                lower(trim(coalesce(m.content, ''))) = '/start'
+                OR lower(trim(coalesce(m.content, ''))) LIKE '/start %'
+                OR lower(trim(coalesce(m.content, ''))) LIKE '/start@%'
+            )
+        """
+        valid_user_predicate = "s.user_id IS NOT NULL AND trim(s.user_id) <> ''"
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            totals_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS sessions,
+                    COUNT(DISTINCT CASE
+                        WHEN user_id IS NOT NULL AND trim(user_id) <> '' THEN source || ':' || user_id
+                    END) AS unique_users_all_sources
+                FROM sessions
+                """
+            ).fetchone()
+            message_totals = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS messages,
+                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user_messages,
+                    SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant_messages,
+                    SUM(CASE WHEN role = 'tool' THEN 1 ELSE 0 END) AS tool_messages
+                FROM messages
+                """
+            ).fetchone()
+            by_source_rows = conn.execute(
+                """
+                SELECT
+                    s.source AS source,
+                    COUNT(DISTINCT s.id) AS sessions,
+                    COUNT(DISTINCT CASE
+                        WHEN s.user_id IS NOT NULL AND trim(s.user_id) <> '' THEN s.user_id
+                    END) AS unique_users,
+                    COUNT(m.id) AS messages,
+                    SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) AS user_messages,
+                    MIN(COALESCE(m.timestamp, s.started_at)) AS first_seen,
+                    MAX(COALESCE(m.timestamp, s.started_at)) AS last_seen
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                GROUP BY s.source
+                ORDER BY unique_users DESC, sessions DESC
+                """
+            ).fetchall()
+            source_row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(DISTINCT s.id) AS sessions,
+                    COUNT(DISTINCT s.user_id) AS unique_users,
+                    COUNT(m.id) AS messages,
+                    SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) AS user_messages,
+                    MIN(COALESCE(m.timestamp, s.started_at)) AS first_seen,
+                    MAX(COALESCE(m.timestamp, s.started_at)) AS last_seen
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                WHERE s.source = ?
+                  AND {valid_user_predicate}
+                """,
+                (source,),
+            ).fetchone()
+            start_row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS start_messages,
+                    COUNT(DISTINCT s.user_id) AS start_users
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE s.source = ?
+                  AND {valid_user_predicate}
+                  AND {start_predicate}
+                """,
+                (source,),
+            ).fetchone()
+
+            users: list[dict[str, object]] = []
+            if include_users:
+                user_rows = conn.execute(
+                    f"""
+                    SELECT
+                        s.user_id AS user_id,
+                        COUNT(DISTINCT s.id) AS sessions,
+                        COUNT(m.id) AS messages,
+                        SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) AS user_messages,
+                        SUM(CASE WHEN {start_predicate} THEN 1 ELSE 0 END) AS start_messages,
+                        MIN(COALESCE(m.timestamp, s.started_at)) AS first_seen,
+                        MAX(COALESCE(m.timestamp, s.started_at)) AS last_seen
+                    FROM sessions s
+                    LEFT JOIN messages m ON m.session_id = s.id
+                    WHERE s.source = ?
+                      AND {valid_user_predicate}
+                    GROUP BY s.user_id
+                    ORDER BY last_seen DESC
+                    LIMIT ?
+                    """,
+                    (source, user_limit),
+                ).fetchall()
+                users = [
+                    {
+                        "source": source,
+                        "user_id": row["user_id"],
+                        "sessions": int(row["sessions"] or 0),
+                        "messages": int(row["messages"] or 0),
+                        "user_messages": int(row["user_messages"] or 0),
+                        "start_messages": int(row["start_messages"] or 0),
+                        "first_seen": _iso_timestamp(row["first_seen"]),
+                        "last_seen": _iso_timestamp(row["last_seen"]),
+                    }
+                    for row in user_rows
+                ]
+
+            return web.json_response(
+                {
+                    "db_path": str(db_path),
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source": source,
+                    "totals": {
+                        "sessions": int(totals_row["sessions"] or 0),
+                        "messages": int(message_totals["messages"] or 0),
+                        "user_messages": int(message_totals["user_messages"] or 0),
+                        "assistant_messages": int(message_totals["assistant_messages"] or 0),
+                        "tool_messages": int(message_totals["tool_messages"] or 0),
+                        "unique_users_all_sources": int(
+                            totals_row["unique_users_all_sources"] or 0
+                        ),
+                    },
+                    "by_source": [
+                        {
+                            "source": row["source"],
+                            "sessions": int(row["sessions"] or 0),
+                            "unique_users": int(row["unique_users"] or 0),
+                            "messages": int(row["messages"] or 0),
+                            "user_messages": int(row["user_messages"] or 0),
+                            "first_seen": _iso_timestamp(row["first_seen"]),
+                            "last_seen": _iso_timestamp(row["last_seen"]),
+                        }
+                        for row in by_source_rows
+                    ],
+                    "selected_source": {
+                        "sessions": int(source_row["sessions"] or 0),
+                        "unique_users": int(source_row["unique_users"] or 0),
+                        "messages": int(source_row["messages"] or 0),
+                        "user_messages": int(source_row["user_messages"] or 0),
+                        "start_users": int(start_row["start_users"] or 0),
+                        "start_messages": int(start_row["start_messages"] or 0),
+                        "first_seen": _iso_timestamp(source_row["first_seen"]),
+                        "last_seen": _iso_timestamp(source_row["last_seen"]),
+                    },
+                    "users": users,
+                }
+            )
+        finally:
+            conn.close()
+
     async def admin_voice_calls(self, request: web.Request) -> web.Response:
         if not self._admin_authorized(request):
             return web.json_response({"detail": "Not found"}, status=404)
@@ -441,6 +631,7 @@ async def _main_async() -> int:
     public_app.router.add_get("/", proxy.health)
     public_app.router.add_get("/health", proxy.health)
     public_app.router.add_get(TRACE_SEARCH_PATH, proxy.trace_search)
+    public_app.router.add_get("/admin/usage-stats", proxy.admin_usage_stats)
     public_app.router.add_get("/admin/voice-calls", proxy.admin_voice_calls)
     public_app.router.add_get("/admin/voice-calls/{call_id}", proxy.admin_voice_call_status)
     public_app.router.add_route("*", webhook_path, proxy.proxy_telegram)
