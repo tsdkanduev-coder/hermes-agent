@@ -322,10 +322,18 @@ async def _ws_handler(request: web.Request) -> web.WebSocketResponse:
     data: dict[str, Any] = payload.get("data") or {}
     system_prompt = str(data.get("systemPrompt") or "")
     phone = str(data.get("phoneNumber") or "unknown")
-    # Модель из initialRequest имеет приоритет только если явно передана
-    req_model = str(data.get("model") or "").strip() or model
+    # gigachatModel — новый ключ; model — старый (backwards compat)
+    req_model = str(data.get("gigachatModel") or data.get("model") or "").strip() or model
+    asr_model = str(data.get("asrModel") or "")
+    enable_denoiser = data.get("enableDenoiser")
 
-    print(f"[server] Звонок на {phone} | модель {req_model} | промпт {len(system_prompt)} симв.")
+    extras = []
+    if asr_model:
+        extras.append(f"asr={asr_model}")
+    if enable_denoiser is not None:
+        extras.append(f"denoiser={enable_denoiser}")
+    extras_str = "  " + " ".join(extras) if extras else ""
+    print(f"[server] Звонок на {phone} | модель {req_model}{extras_str} | промпт {len(system_prompt)} симв.")
 
     # 3. Разговор
     await _run_call(ws, system_prompt, phone, operator_lines, provider, api_key, req_model)
