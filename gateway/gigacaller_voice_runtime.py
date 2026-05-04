@@ -200,7 +200,12 @@ class GigaCallerVoiceRuntime(VoiceCallRuntime):
     async def _giga_call_runner(self, call: CallRecord) -> None:
         url = _giga_wss_url()
         voice = os.environ.get("GIGACALLER_VOICE", DEFAULT_GIGACALLER_VOICE).strip()
-        model = os.environ.get("GIGACALLER_MODEL", "").strip()
+        gigachat_model = (
+            os.environ.get("GIGACALLER_GIGACHAT_MODEL", "")
+            or os.environ.get("GIGACALLER_MODEL", "")  # backwards compat
+        ).strip()
+        asr_model = os.environ.get("GIGACALLER_ASR_MODEL", "").strip()
+        enable_denoiser_env = os.environ.get("GIGACALLER_ENABLE_DENOISER", "").strip()
         prompt = _build_system_prompt(call)
         payload: dict[str, Any] = {
             "phoneNumber": call.to,
@@ -208,8 +213,12 @@ class GigaCallerVoiceRuntime(VoiceCallRuntime):
             "retry": "",
             "voice": voice,
         }
-        if model:
-            payload["model"] = model
+        if gigachat_model:
+            payload["gigachatModel"] = gigachat_model
+        if asr_model:
+            payload["asrModel"] = asr_model
+        if enable_denoiser_env:
+            payload["enableDenoiser"] = _truthy(enable_denoiser_env)
         initial = {"type": "initialRequest", "data": payload}
 
         timeout = aiohttp.ClientTimeout(
