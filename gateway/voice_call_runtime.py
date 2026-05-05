@@ -244,6 +244,9 @@ class SaluteSpeechTranscriber:
         self.content_type = os.environ.get(
             "SBER_SALUTE_CONTENT_TYPE", "audio/pcmu;rate=8000"
         ).strip()
+        self.user_agent = (
+            os.environ.get("SBER_SALUTE_USER_AGENT", "GigaVoice").strip() or "GigaVoice"
+        )
         self.insecure = _truthy(os.environ.get("SBER_SALUTE_INSECURE"))
         self.enabled = bool(self.auth_key)
         self._token: str = ""
@@ -270,6 +273,7 @@ class SaluteSpeechTranscriber:
                         "Authorization": f"Bearer {token}",
                         "Content-Type": self.content_type,
                         "Accept": "application/json",
+                        "User-Agent": self.user_agent,
                     },
                     ssl=ssl_arg,
                 ) as response:
@@ -318,6 +322,7 @@ class SaluteSpeechTranscriber:
                         "RqUID": str(uuid.uuid4()),
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Accept": "application/json",
+                        "User-Agent": self.user_agent,
                     },
                     ssl=ssl_arg,
                 ) as response:
@@ -332,10 +337,27 @@ class SaluteSpeechTranscriber:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Sber OAuth returned non-JSON response: {payload_text[:120]}") from exc
-        token = str(payload.get("access_token") or payload.get("token") or "").strip()
+        token, expires_at_float = self._parse_oauth_payload(payload, now)
+        self._token = token
+        self._token_expires_at = expires_at_float
+        return token
+
+    @staticmethod
+    def _parse_oauth_payload(payload: dict[str, Any], now: float) -> tuple[str, float]:
+        token = str(
+            payload.get("access_token")
+            or payload.get("token")
+            or payload.get("tok")
+            or ""
+        ).strip()
         if not token:
             raise RuntimeError("Sber OAuth response has no access_token")
-        expires_at = payload.get("expires_at") or payload.get("expiresAt") or 0
+        expires_at = (
+            payload.get("expires_at")
+            or payload.get("expiresAt")
+            or payload.get("exp")
+            or 0
+        )
         try:
             expires_at_float = float(expires_at)
             if expires_at_float > 10_000_000_000:
@@ -344,9 +366,7 @@ class SaluteSpeechTranscriber:
             expires_at_float = now + 25 * 60
         if expires_at_float <= now:
             expires_at_float = now + 25 * 60
-        self._token = token
-        self._token_expires_at = expires_at_float
-        return token
+        return token, expires_at_float
 
     @staticmethod
     def _extract_transcript(payload_text: str) -> str:

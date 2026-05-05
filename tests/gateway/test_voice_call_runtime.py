@@ -35,6 +35,24 @@ def test_salute_transcript_extractor_handles_common_payloads():
     ) == "Добрый день. Слушаю вас."
 
 
+def test_salute_oauth_parser_accepts_legacy_and_giga_chat_payloads():
+    now = 1_778_000_000.0
+
+    legacy_token, legacy_expires_at = SaluteSpeechTranscriber._parse_oauth_payload(
+        {"access_token": "legacy-token", "expires_at": 1_778_001_000_000},
+        now,
+    )
+    giga_token, giga_expires_at = SaluteSpeechTranscriber._parse_oauth_payload(
+        {"tok": "giga-token", "exp": 1_778_002_000},
+        now,
+    )
+
+    assert legacy_token == "legacy-token"
+    assert legacy_expires_at == 1_778_001_000
+    assert giga_token == "giga-token"
+    assert giga_expires_at == 1_778_002_000
+
+
 def test_voice_vad_defaults_to_labota_fast_turn_taking(monkeypatch):
     monkeypatch.delenv("VOICE_CALL_VAD_EAGERNESS", raising=False)
     assert _voice_vad_eagerness() == "high"

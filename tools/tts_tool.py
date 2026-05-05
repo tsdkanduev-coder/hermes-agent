@@ -115,13 +115,15 @@ DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_SBER_SALUTE_TTS_VOICE = "May_24000"
 DEFAULT_SBER_SALUTE_TTS_FORMAT = "opus"
-SBER_SALUTE_OAUTH_URL = os.getenv(
-    "SBER_SALUTE_OAUTH_URL",
-    "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+DEFAULT_SBER_SALUTE_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+DEFAULT_SBER_SALUTE_SYNTH_URL = "https://smartspeech.sber.ru/rest/v1/text:synthesize"
+SBER_SALUTE_OAUTH_URL = (
+    os.getenv("SBER_SALUTE_TTS_OAUTH_URL", "").strip()
+    or os.getenv("SBER_SALUTE_OAUTH_URL", DEFAULT_SBER_SALUTE_OAUTH_URL)
 )
-SBER_SALUTE_SYNTH_URL = os.getenv(
-    "SBER_SALUTE_SYNTH_URL",
-    "https://smartspeech.sber.ru/rest/v1/text:synthesize",
+SBER_SALUTE_SYNTH_URL = (
+    os.getenv("SBER_SALUTE_TTS_SYNTH_URL", "").strip()
+    or os.getenv("SBER_SALUTE_SYNTH_URL", DEFAULT_SBER_SALUTE_SYNTH_URL)
 )
 # Sber's WAF in front of speech.giga.chat blocks requests without a recognised
 # User-Agent. Send the SDK UA on every Sber-bound call — harmless on the
