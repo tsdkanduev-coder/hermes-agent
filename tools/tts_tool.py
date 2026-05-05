@@ -528,9 +528,12 @@ def _sber_salute_tts_access_token() -> str:
     if _sber_tts_token and _sber_tts_token_expires_at - 60 > now:
         return _sber_tts_token
 
-    auth_key = os.getenv("SBER_SALUTE_AUTH_KEY", "").strip()
+    auth_key = (
+        os.getenv("SBER_SALUTE_TTS_AUTH_KEY", "").strip()
+        or os.getenv("SBER_SALUTE_AUTH_KEY", "").strip()
+    )
     if not auth_key:
-        raise ValueError("SBER_SALUTE_AUTH_KEY not set")
+        raise ValueError("SBER_SALUTE_TTS_AUTH_KEY or SBER_SALUTE_AUTH_KEY not set")
 
     import requests
 
