@@ -91,6 +91,10 @@ SBER_SALUTE_RECOGNIZE_URL = os.getenv(
     "SBER_SALUTE_RECOGNIZE_URL",
     "https://smartspeech.sber.ru/rest/v1/speech:recognize",
 )
+# Sber's WAF in front of speech.giga.chat blocks requests without a recognised
+# User-Agent. Send the SDK UA on every Sber-bound call — harmless on the
+# legacy ngw.devices.sberbank.ru / smartspeech.sber.ru hosts.
+SBER_SALUTE_USER_AGENT = os.getenv("SBER_SALUTE_USER_AGENT", "GigaVoice")
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
@@ -767,6 +771,7 @@ def _sber_salute_access_token() -> str:
                 "RqUID": str(uuid.uuid4()),
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                "User-Agent": SBER_SALUTE_USER_AGENT,
             },
             timeout=timeout,
             verify=verify,
@@ -784,11 +789,24 @@ def _sber_salute_access_token() -> str:
     else:
         raise RuntimeError(last_error or "Sber OAuth failed")
 
-    token = str(payload.get("access_token") or payload.get("token") or "").strip()
+    # Two response shapes in the wild:
+    #   * ngw.devices.sberbank.ru → {"access_token": ..., "expires_at": <ms>}
+    #   * speech.giga.chat        → {"tok": ..., "exp": <seconds>}
+    token = str(
+        payload.get("access_token")
+        or payload.get("token")
+        or payload.get("tok")
+        or ""
+    ).strip()
     if not token:
         raise RuntimeError("Sber OAuth response has no access_token")
 
-    expires_at = payload.get("expires_at") or payload.get("expiresAt") or 0
+    expires_at = (
+        payload.get("expires_at")
+        or payload.get("expiresAt")
+        or payload.get("exp")
+        or 0
+    )
     try:
         expires_at_float = float(expires_at)
         if expires_at_float > 10_000_000_000:
@@ -904,6 +922,7 @@ def _transcribe_sber_salute(file_path: str, model_name: str) -> Dict[str, Any]:
                         "Authorization": f"Bearer {token}",
                         "Content-Type": content_type,
                         "Accept": "application/json",
+                        "User-Agent": SBER_SALUTE_USER_AGENT,
                     },
                     timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
                     verify=not _sber_salute_insecure(),

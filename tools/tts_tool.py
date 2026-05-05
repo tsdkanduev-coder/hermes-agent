@@ -123,6 +123,10 @@ SBER_SALUTE_SYNTH_URL = os.getenv(
     "SBER_SALUTE_SYNTH_URL",
     "https://smartspeech.sber.ru/rest/v1/text:synthesize",
 )
+# Sber's WAF in front of speech.giga.chat blocks requests without a recognised
+# User-Agent. Send the SDK UA on every Sber-bound call — harmless on the
+# legacy ngw.devices.sberbank.ru / smartspeech.sber.ru hosts.
+SBER_SALUTE_USER_AGENT = os.getenv("SBER_SALUTE_USER_AGENT", "GigaVoice")
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -539,6 +543,7 @@ def _sber_salute_tts_access_token() -> str:
                 "RqUID": str(uuid.uuid4()),
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                "User-Agent": SBER_SALUTE_USER_AGENT,
             },
             timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
             verify=not _sber_salute_insecure(),
@@ -551,11 +556,24 @@ def _sber_salute_tts_access_token() -> str:
     else:
         raise RuntimeError(last_error or "Sber OAuth failed")
 
-    token = str(payload.get("access_token") or payload.get("token") or "").strip()
+    # Two response shapes in the wild:
+    #   * ngw.devices.sberbank.ru → {"access_token": ..., "expires_at": <ms>}
+    #   * speech.giga.chat        → {"tok": ..., "exp": <seconds>}
+    token = str(
+        payload.get("access_token")
+        or payload.get("token")
+        or payload.get("tok")
+        or ""
+    ).strip()
     if not token:
         raise RuntimeError("Sber OAuth response has no access_token")
 
-    expires_at = payload.get("expires_at") or payload.get("expiresAt") or 0
+    expires_at = (
+        payload.get("expires_at")
+        or payload.get("expiresAt")
+        or payload.get("exp")
+        or 0
+    )
     try:
         expires_at_float = float(expires_at)
         if expires_at_float > 10_000_000_000:
@@ -597,6 +615,7 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
             "Authorization": f"Bearer {_sber_salute_tts_access_token()}",
             "Content-Type": content_type,
             "Accept": "audio/ogg;codecs=opus" if audio_format == "opus" else "audio/*",
+            "User-Agent": SBER_SALUTE_USER_AGENT,
         },
         timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
         verify=not _sber_salute_insecure(),
