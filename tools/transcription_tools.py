@@ -781,6 +781,7 @@ def _transcribe_salute(file_path: str, _model_name: str) -> Dict[str, Any]:
     On HTTP 401 we invalidate the cached token once and retry.
     """
     from tools.sber_salute_auth import (
+        USER_AGENT as _SALUTE_USER_AGENT,
         SmartSpeechError as _SaluteAuthError,
         get_access_token,
         get_verify,
@@ -844,6 +845,7 @@ def _transcribe_salute(file_path: str, _model_name: str) -> Dict[str, Any]:
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": content_type,
+                    "User-Agent": _SALUTE_USER_AGENT,
                 },
                 data=audio_bytes,
                 timeout=120,

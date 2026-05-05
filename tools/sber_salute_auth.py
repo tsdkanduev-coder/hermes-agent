@@ -29,8 +29,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+DEFAULT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 DEFAULT_SCOPE = "SALUTE_SPEECH_CORP"
+# Sber's WAF in front of speech.giga.chat blocks requests without a recognised
+# User-Agent. Send the same UA the Sber SDKs use so we don't get rate-limited
+# or 403'd. Harmless on the legacy ngw.devices.sberbank.ru endpoint.
+USER_AGENT = "GigaVoice"
+
+
+def get_oauth_url() -> str:
+    """OAuth token endpoint (override with ``SBER_SALUTE_OAUTH_URL``)."""
+    return (os.getenv("SBER_SALUTE_OAUTH_URL") or DEFAULT_OAUTH_URL).strip() or DEFAULT_OAUTH_URL
 
 # Refresh the cached token when fewer than this many seconds remain on it.
 _REFRESH_GRACE_SECONDS = 60
@@ -168,12 +177,13 @@ def _request_token(creds: SaluteCredentials) -> tuple[str, float]:
     rq_uid = str(uuid.uuid4())
     try:
         response = requests.post(
-            OAUTH_URL,
+            get_oauth_url(),
             headers={
                 "Authorization": f"Basic {creds.auth_key}",
                 "RqUID": rq_uid,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                "User-Agent": USER_AGENT,
             },
             data={"scope": creds.scope},
             timeout=30,
@@ -196,16 +206,18 @@ def _request_token(creds: SaluteCredentials) -> tuple[str, float]:
         )
 
     payload = response.json()
-    token = payload.get("access_token")
+    # Two response shapes in the wild:
+    #   * ngw.devices.sberbank.ru → {"access_token": "...", "expires_at": <ms>}
+    #   * speech.giga.chat        → {"tok": "...", "exp": <seconds>}
+    token = payload.get("access_token") or payload.get("tok")
     if not token:
         raise SmartSpeechError(
             f"SaluteSpeech OAuth response missing access_token: {payload!r}"
         )
 
-    # Sber returns ``expires_at`` in *milliseconds* since epoch.  Be lenient
-    # if a future API version switches to seconds — anything > year-3000
-    # ms timestamp would be implausible as seconds, so detect by magnitude.
     expires_at_raw = payload.get("expires_at")
+    if expires_at_raw is None:
+        expires_at_raw = payload.get("exp")
     if isinstance(expires_at_raw, (int, float)) and expires_at_raw > 0:
         expires_at = float(expires_at_raw)
         if expires_at > 1e12:  # milliseconds

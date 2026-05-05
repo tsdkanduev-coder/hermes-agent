@@ -475,6 +475,7 @@ def _generate_salute_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     """
     import requests
     from tools.sber_salute_auth import (
+        USER_AGENT as _SALUTE_USER_AGENT,
         SmartSpeechError,
         get_access_token,
         get_verify,
@@ -509,6 +510,7 @@ def _generate_salute_tts(text: str, output_path: str, tts_config: Dict[str, Any]
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/text",
+                "User-Agent": _SALUTE_USER_AGENT,
             },
             data=text.encode("utf-8"),
             timeout=60,
