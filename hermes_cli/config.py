@@ -625,10 +625,6 @@ DEFAULT_CONFIG = {
     # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
     "tts": {
         "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" (local)
-        # Allow the agent to emit SSML markup in voice replies (currently
-        # consumed only by the sber_salute provider). Off by default; env
-        # var HERMES_TTS_SSML_ENABLED=1 overrides. See tools/tts_tool.py
-        # _ssml_feature_enabled().
         "ssml_enabled": False,
         "edge": {
             "voice": "en-US-AriaNeural",

@@ -1,5 +1,3 @@
-"""Tests for the SSML helpers and Sber SaluteSpeech SSML emission path."""
-
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,16 +15,12 @@ def clean_env(monkeypatch):
         "HERMES_SESSION_PLATFORM",
     ):
         monkeypatch.delenv(key, raising=False)
-    # Reset the Sber token cache between tests so each one fetches its own.
     from tools import tts_tool
     tts_tool._sber_tts_token = ""
     tts_tool._sber_tts_token_scope = ""
     tts_tool._sber_tts_token_expires_at = 0.0
 
 
-# ===========================================================================
-# Helpers: _contains_ssml / _strip_ssml / _ensure_ssml_envelope
-# ===========================================================================
 class TestContainsSsml:
     def test_speak_tag(self):
         from tools.tts_tool import _contains_ssml
@@ -54,7 +48,6 @@ class TestContainsSsml:
 
     def test_non_ssml_angle_brackets(self):
         from tools.tts_tool import _contains_ssml
-        # Generic XML-ish tags that aren't in our SSML vocabulary
         assert _contains_ssml("a < b and c > d") is False
         assert _contains_ssml("<unknown>foo</unknown>") is False
 
@@ -85,9 +78,6 @@ class TestStripSsml:
 
     def test_collapses_whitespace(self):
         from tools.tts_tool import _strip_ssml
-        # Tags between words leave the surrounding text untouched, so
-        # spaces collapse but the tag itself is just a delete; "<break/>c"
-        # produces "c" (no inserted gap).
         out = _strip_ssml("<speak>a <break/>   b   <break/> c</speak>")
         assert out == "a b c"
 
@@ -115,16 +105,11 @@ class TestEnsureSsmlEnvelope:
     def test_passthrough_speak_with_leading_whitespace(self):
         from tools.tts_tool import _ensure_ssml_envelope
         src = "  <speak>x</speak>"
-        # Leading whitespace doesn't trigger re-wrapping
         assert _ensure_ssml_envelope(src) == src
 
 
-# ===========================================================================
-# Feature flag: _ssml_feature_enabled
-# ===========================================================================
 class TestSsmlFeatureEnabled:
     def test_default_off(self, monkeypatch):
-        # No env, no config override
         with patch("tools.tts_tool._load_tts_config", return_value={}):
             from tools.tts_tool import _ssml_feature_enabled
             assert _ssml_feature_enabled() is False
@@ -163,9 +148,6 @@ class TestSsmlFeatureEnabled:
             assert _ssml_feature_enabled() is False
 
 
-# ===========================================================================
-# Sber SaluteSpeech: wrap + retry behaviour
-# ===========================================================================
 def _ok_token_response():
     import time
     response = MagicMock()
@@ -212,12 +194,7 @@ class TestSberSaluteSsmlPath:
         assert synth_call.kwargs["headers"]["Content-Type"] == "application/ssml"
 
     def test_ssml_disabled_keeps_raw_text(self, tmp_path, monkeypatch):
-        # Even with SSML in the body, when the feature is OFF we don't
-        # auto-wrap. The legacy auto-detect (text starts with <speak>) still
-        # picks ssml content-type — but a body that *starts* with plain text
-        # plus inline tags would go as application/text.
         monkeypatch.setenv("SBER_SALUTE_AUTH_KEY", "abc==")
-        # HERMES_TTS_SSML_ENABLED unset → off
         out = str(tmp_path / "out.ogg")
         body = 'Привет <break time="500ms"/>мир'
 
@@ -245,17 +222,14 @@ class TestSberSaluteSsmlPath:
             from tools.tts_tool import _generate_sber_salute_tts
             _generate_sber_salute_tts(body, out, {})
 
-        # Three POSTs: OAuth, SSML attempt, plain-text retry
         assert mock_post.call_count == 3
         retry_call = mock_post.call_args_list[2]
         assert retry_call.kwargs["headers"]["Content-Type"] == "application/text"
         sent_body = retry_call.kwargs["data"].decode("utf-8")
-        # Tags stripped, plain text preserved
         assert "<break" not in sent_body
         assert "Привет" in sent_body and "мир" in sent_body
 
     def test_400_non_ssml_body_does_not_retry(self, tmp_path, monkeypatch):
-        # Plain text body + HTTP 400 → no retry, original error raised.
         monkeypatch.setenv("SBER_SALUTE_AUTH_KEY", "abc==")
         out = str(tmp_path / "out.ogg")
 
@@ -268,15 +242,11 @@ class TestSberSaluteSsmlPath:
             with pytest.raises(ValueError, match="HTTP 400"):
                 _generate_sber_salute_tts("просто текст", out, {})
 
-        assert mock_post.call_count == 2  # OAuth + one failed synth, no retry
+        assert mock_post.call_count == 2
 
 
-# ===========================================================================
-# Dispatcher: provider-aware SSML stripping
-# ===========================================================================
 class TestProviderAwareSsmlStrip:
     def test_openai_receives_stripped_text(self, tmp_path, monkeypatch):
-        # When provider != sber_salute, SSML tags get stripped before dispatch.
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-fake")
         out = str(tmp_path / "out.mp3")
 
@@ -303,7 +273,6 @@ class TestProviderAwareSsmlStrip:
         assert "Привет" in captured["text"] and "мир" in captured["text"]
 
     def test_sber_salute_keeps_ssml(self, tmp_path, monkeypatch):
-        # When provider == sber_salute, the dispatcher must NOT strip SSML.
         monkeypatch.setenv("SBER_SALUTE_AUTH_KEY", "abc==")
         monkeypatch.setenv("HERMES_TTS_SSML_ENABLED", "1")
         out = str(tmp_path / "out.ogg")

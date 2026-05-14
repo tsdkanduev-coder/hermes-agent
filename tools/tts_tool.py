@@ -600,10 +600,6 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
         or DEFAULT_SBER_SALUTE_TTS_VOICE
     ).strip()
     audio_format = _sber_salute_tts_format(tts_config)
-    # If SSML is enabled and the caller emitted any SSML tags, make sure the
-    # body is a valid <speak>…</speak> envelope. Otherwise let the content
-    # type fall back to plain text — SaluteSpeech's SSML parser otherwise
-    # runs heuristics on raw text and logs warnings on Sber's side.
     if _ssml_feature_enabled() and _contains_ssml(text):
         text = _ensure_ssml_envelope(text)
 
@@ -641,9 +637,6 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
 
     response = _do_post(text, content_type)
 
-    # If Sber rejects the SSML body (malformed tags, unsupported attribute,
-    # unescaped entities), retry once with the tags stripped so a single bad
-    # SSML reply doesn't cost the user the audio entirely.
     if (
         response.status_code == 400
         and content_type == "application/ssml"
@@ -1154,10 +1147,6 @@ def text_to_speech_tool(
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
-    # Strip SSML tags for providers that don't understand them. Without this
-    # OpenAI/ElevenLabs/etc. would read "<break time=500ms/>" literally as
-    # speech. sber_salute is the only provider that consumes SSML — it gets
-    # wrapped and sent as application/ssml inside _generate_sber_salute_tts.
     if provider != "sber_salute" and _contains_ssml(text):
         logger.info(
             "Stripping SSML tags from TTS text (provider=%s doesn't support SSML)",
@@ -1463,12 +1452,7 @@ _MD_EXCESS_NL = re.compile(r'\n{3,}')
 
 
 def _strip_markdown_for_tts(text: str) -> str:
-    """Remove markdown formatting that shouldn't be spoken aloud.
-
-    Note: SSML tags (``<speak>``, ``<break/>``, ``<prosody …>``, etc.) pass
-    through unchanged — none of the ``_MD_*`` patterns above touch angle
-    brackets, so callers that emit SSML can rely on it surviving this step.
-    """
+    """Remove markdown formatting that shouldn't be spoken aloud."""
     text = _MD_CODE_BLOCK.sub(' ', text)
     text = _MD_LINK.sub(r'\1', text)
     text = _MD_URL.sub('', text)
@@ -1482,16 +1466,6 @@ def _strip_markdown_for_tts(text: str) -> str:
     return text.strip()
 
 
-# ---------------------------------------------------------------------------
-# SSML helpers
-# ---------------------------------------------------------------------------
-# Sber SaluteSpeech accepts SSML on every voice in the catalog (classical and
-# Freespeech alike — empirically verified, see project memory). The agent can
-# emit SSML inline in its reply when ``HERMES_TTS_SSML_ENABLED=1`` or
-# ``tts.ssml_enabled: true`` is set; downstream we wrap, escape, and (on
-# failure) auto-fall-back to plain text so a single malformed reply never
-# costs the user the audio. Other TTS providers don't understand SSML and
-# would read tags literally, so the dispatcher strips SSML for them.
 _SSML_TAG_RE = re.compile(
     r"</?(?:speak|break|prosody|emphasis|say-as|sub|p|s|voice|audio|mark)\b[^>]*/?>",
     re.IGNORECASE,
@@ -1503,7 +1477,6 @@ def _contains_ssml(text: str) -> bool:
 
 
 def _strip_ssml(text: str) -> str:
-    """Remove SSML tags + decode common XML entities. Safe for text channels."""
     if not text:
         return text
     cleaned = _SSML_TAG_RE.sub("", text)
@@ -1514,12 +1487,10 @@ def _strip_ssml(text: str) -> str:
         .replace("&quot;", '"')
         .replace("&apos;", "'")
     )
-    # Collapse the whitespace that the removed tags often leave behind.
     return re.sub(r"[ \t]+", " ", cleaned).strip()
 
 
 def _ensure_ssml_envelope(text: str) -> str:
-    """Wrap *text* in ``<speak>…</speak>`` if it has SSML tags but no envelope."""
     if not text:
         return text
     if text.lstrip().startswith("<speak"):
@@ -1530,13 +1501,6 @@ def _ensure_ssml_envelope(text: str) -> str:
 
 
 def _ssml_feature_enabled() -> bool:
-    """Master kill-switch for agent-emitted SSML. Off by default.
-
-    Resolution order:
-      1. ``HERMES_TTS_SSML_ENABLED`` env (1/true/yes/on or 0/false/no/off)
-      2. ``tts.ssml_enabled`` in the user config (bool)
-      3. ``False``
-    """
     env = (os.getenv("HERMES_TTS_SSML_ENABLED") or "").strip().lower()
     if env in ("1", "true", "yes", "on"):
         return True

@@ -425,13 +425,6 @@ _CONTROL_INTERRUPT_MESSAGES = frozenset(
 )
 
 
-# Voice-aware SSML instruction appended to ``context_prompt`` only when:
-#   * voice mode is "all", or "voice_only" + the current message is a voice input;
-#   * the SSML feature flag is on (HERMES_TTS_SSML_ENABLED=1 or tts.ssml_enabled);
-#   * tts.provider == "sber_salute" (other providers don't consume SSML).
-# Russian — the SaluteSpeech provider is used almost exclusively in Russian
-# contexts and the LLM produces Russian replies; the prompt itself doubles as
-# a hint about the response language.
 _VOICE_SSML_PROMPT = (
     "[Голосовой режим активен — твой ответ будет озвучен через "
     "Sber SaluteSpeech. Ты можешь использовать SSML-разметку для управления "
@@ -4550,11 +4543,6 @@ class GatewayRunner:
                 if vc_context:
                     context_prompt += f"\n\n{vc_context}"
 
-        # -----------------------------------------------------------------
-        # SSML instruction — inject only when the agent's reply is likely to
-        # be spoken AND the SSML feature is enabled AND the active TTS
-        # provider is sber_salute (others would read tags literally).
-        # -----------------------------------------------------------------
         try:
             from tools.tts_tool import _ssml_feature_enabled
             voice_mode = self._voice_mode.get(
@@ -4574,7 +4562,6 @@ class GatewayRunner:
                         (context_prompt or "") + f"\n\n{_VOICE_SSML_PROMPT}"
                     )
         except Exception:
-            # Never let prompt augmentation break the main reply path.
             logger.debug("SSML prompt injection skipped", exc_info=True)
 
         # -----------------------------------------------------------------
@@ -4894,10 +4881,7 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
-            # Auto voice reply: send TTS audio before the text response.
-            # The voice path receives the raw response (with SSML); the text
-            # path below gets a cleaned copy so the chat bubble doesn't show
-            # XML tags to the user.
+            # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
