@@ -600,11 +600,21 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
         or DEFAULT_SBER_SALUTE_TTS_VOICE
     ).strip()
     audio_format = _sber_salute_tts_format(tts_config)
-    content_type = str(
+    # Auto-pick the content type from the body itself: SaluteSpeech's SSML
+    # parser otherwise tries to repair plain text with heuristics (see the
+    # "SSML was fixed by heuristics" / "SSML was replaced by dictionary"
+    # warnings in Sber's logs). Override via env / config when callers ship
+    # genuinely-prepared SSML that doesn't start with <speak>.
+    explicit_content_type = (
         os.getenv("SBER_SALUTE_TTS_CONTENT_TYPE", "").strip()
-        or cfg.get("content_type")
-        or "application/ssml"
-    ).strip()
+        or str(cfg.get("content_type") or "").strip()
+    )
+    if explicit_content_type:
+        content_type = explicit_content_type
+    elif text.lstrip().startswith("<speak"):
+        content_type = "application/ssml"
+    else:
+        content_type = "application/text"
 
     params: Dict[str, str] = {"format": audio_format}
     if voice:
