@@ -600,11 +600,13 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
         or DEFAULT_SBER_SALUTE_TTS_VOICE
     ).strip()
     audio_format = _sber_salute_tts_format(tts_config)
-    # Auto-pick the content type from the body itself: SaluteSpeech's SSML
-    # parser otherwise tries to repair plain text with heuristics (see the
-    # "SSML was fixed by heuristics" / "SSML was replaced by dictionary"
-    # warnings in Sber's logs). Override via env / config when callers ship
-    # genuinely-prepared SSML that doesn't start with <speak>.
+    # If SSML is enabled and the caller emitted any SSML tags, make sure the
+    # body is a valid <speak>…</speak> envelope. Otherwise let the content
+    # type fall back to plain text — SaluteSpeech's SSML parser otherwise
+    # runs heuristics on raw text and logs warnings on Sber's side.
+    if _ssml_feature_enabled() and _contains_ssml(text):
+        text = _ensure_ssml_envelope(text)
+
     explicit_content_type = (
         os.getenv("SBER_SALUTE_TTS_CONTENT_TYPE", "").strip()
         or str(cfg.get("content_type") or "").strip()
@@ -622,28 +624,50 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
 
     import requests
 
-    response = requests.post(
-        SBER_SALUTE_SYNTH_URL,
-        params=params,
-        data=text.encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {_sber_salute_tts_access_token()}",
-            "Content-Type": content_type,
-            "Accept": "audio/ogg;codecs=opus" if audio_format == "opus" else "audio/*",
-            "User-Agent": SBER_SALUTE_USER_AGENT,
-        },
-        timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
-        verify=not _sber_salute_insecure(),
-    )
+    def _do_post(body: str, ct: str) -> "requests.Response":
+        return requests.post(
+            SBER_SALUTE_SYNTH_URL,
+            params=params,
+            data=body.encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {_sber_salute_tts_access_token()}",
+                "Content-Type": ct,
+                "Accept": "audio/ogg;codecs=opus" if audio_format == "opus" else "audio/*",
+                "User-Agent": SBER_SALUTE_USER_AGENT,
+            },
+            timeout=float(os.getenv("SBER_SALUTE_TIMEOUT", "60")),
+            verify=not _sber_salute_insecure(),
+        )
+
+    response = _do_post(text, content_type)
+
+    # If Sber rejects the SSML body (malformed tags, unsupported attribute,
+    # unescaped entities), retry once with the tags stripped so a single bad
+    # SSML reply doesn't cost the user the audio entirely.
+    if (
+        response.status_code == 400
+        and content_type == "application/ssml"
+        and _contains_ssml(text)
+    ):
+        body_preview = (response.text or "")[:300]
+        logger.warning(
+            "Sber rejected SSML body (HTTP 400), retrying as plain text: %s",
+            body_preview,
+        )
+        text = _strip_ssml(text)
+        content_type = "application/text"
+        response = _do_post(text, content_type)
+
     if response.status_code >= 400:
         raise ValueError(f"Sber SaluteSpeech TTS HTTP {response.status_code}: {response.text[:300]}")
 
     Path(output_path).write_bytes(response.content)
     logger.info(
-        "Generated speech with Sber SaluteSpeech (voice=%s, format=%s, scope=%s)",
+        "Generated speech with Sber SaluteSpeech (voice=%s, format=%s, scope=%s, content_type=%s)",
         voice,
         audio_format,
         _sber_tts_token_scope or "unknown",
+        content_type,
     )
     return output_path
 
@@ -1130,6 +1154,17 @@ def text_to_speech_tool(
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
+    # Strip SSML tags for providers that don't understand them. Without this
+    # OpenAI/ElevenLabs/etc. would read "<break time=500ms/>" literally as
+    # speech. sber_salute is the only provider that consumes SSML — it gets
+    # wrapped and sent as application/ssml inside _generate_sber_salute_tts.
+    if provider != "sber_salute" and _contains_ssml(text):
+        logger.info(
+            "Stripping SSML tags from TTS text (provider=%s doesn't support SSML)",
+            provider,
+        )
+        text = _strip_ssml(text)
+
     # Truncate very long text with a warning. The cap is per-provider
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
     max_len = _resolve_max_text_length(provider, tts_config)
@@ -1428,7 +1463,12 @@ _MD_EXCESS_NL = re.compile(r'\n{3,}')
 
 
 def _strip_markdown_for_tts(text: str) -> str:
-    """Remove markdown formatting that shouldn't be spoken aloud."""
+    """Remove markdown formatting that shouldn't be spoken aloud.
+
+    Note: SSML tags (``<speak>``, ``<break/>``, ``<prosody …>``, etc.) pass
+    through unchanged — none of the ``_MD_*`` patterns above touch angle
+    brackets, so callers that emit SSML can rely on it surviving this step.
+    """
     text = _MD_CODE_BLOCK.sub(' ', text)
     text = _MD_LINK.sub(r'\1', text)
     text = _MD_URL.sub('', text)
@@ -1440,6 +1480,73 @@ def _strip_markdown_for_tts(text: str) -> str:
     text = _MD_HR.sub('', text)
     text = _MD_EXCESS_NL.sub('\n\n', text)
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# SSML helpers
+# ---------------------------------------------------------------------------
+# Sber SaluteSpeech accepts SSML on every voice in the catalog (classical and
+# Freespeech alike — empirically verified, see project memory). The agent can
+# emit SSML inline in its reply when ``HERMES_TTS_SSML_ENABLED=1`` or
+# ``tts.ssml_enabled: true`` is set; downstream we wrap, escape, and (on
+# failure) auto-fall-back to plain text so a single malformed reply never
+# costs the user the audio. Other TTS providers don't understand SSML and
+# would read tags literally, so the dispatcher strips SSML for them.
+_SSML_TAG_RE = re.compile(
+    r"</?(?:speak|break|prosody|emphasis|say-as|sub|p|s|voice|audio|mark)\b[^>]*/?>",
+    re.IGNORECASE,
+)
+
+
+def _contains_ssml(text: str) -> bool:
+    return bool(text) and bool(_SSML_TAG_RE.search(text))
+
+
+def _strip_ssml(text: str) -> str:
+    """Remove SSML tags + decode common XML entities. Safe for text channels."""
+    if not text:
+        return text
+    cleaned = _SSML_TAG_RE.sub("", text)
+    cleaned = (
+        cleaned.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&apos;", "'")
+    )
+    # Collapse the whitespace that the removed tags often leave behind.
+    return re.sub(r"[ \t]+", " ", cleaned).strip()
+
+
+def _ensure_ssml_envelope(text: str) -> str:
+    """Wrap *text* in ``<speak>…</speak>`` if it has SSML tags but no envelope."""
+    if not text:
+        return text
+    if text.lstrip().startswith("<speak"):
+        return text
+    if _contains_ssml(text):
+        return f"<speak>{text}</speak>"
+    return text
+
+
+def _ssml_feature_enabled() -> bool:
+    """Master kill-switch for agent-emitted SSML. Off by default.
+
+    Resolution order:
+      1. ``HERMES_TTS_SSML_ENABLED`` env (1/true/yes/on or 0/false/no/off)
+      2. ``tts.ssml_enabled`` in the user config (bool)
+      3. ``False``
+    """
+    env = (os.getenv("HERMES_TTS_SSML_ENABLED") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        cfg = _load_tts_config() or {}
+    except Exception:
+        return False
+    return bool(cfg.get("ssml_enabled", False))
 
 
 def stream_tts_to_speaker(

@@ -425,6 +425,32 @@ _CONTROL_INTERRUPT_MESSAGES = frozenset(
 )
 
 
+# Voice-aware SSML instruction appended to ``context_prompt`` only when:
+#   * voice mode is "all", or "voice_only" + the current message is a voice input;
+#   * the SSML feature flag is on (HERMES_TTS_SSML_ENABLED=1 or tts.ssml_enabled);
+#   * tts.provider == "sber_salute" (other providers don't consume SSML).
+# Russian — the SaluteSpeech provider is used almost exclusively in Russian
+# contexts and the LLM produces Russian replies; the prompt itself doubles as
+# a hint about the response language.
+_VOICE_SSML_PROMPT = (
+    "[Голосовой режим активен — твой ответ будет озвучен через "
+    "Sber SaluteSpeech. Ты можешь использовать SSML-разметку для управления "
+    "интонацией и паузами. Оборачивай произносимый текст в <speak>…</speak>. "
+    "Доступные теги:\n"
+    "  <break time=\"500ms\"/>                                    — пауза заданной длительности\n"
+    "  <prosody rate=\"slow|fast|x-slow|x-fast\">…</prosody>      — темп речи\n"
+    "  <prosody pitch=\"+10%\" volume=\"loud\">…</prosody>         — высота/громкость\n"
+    "  <emphasis level=\"moderate|strong\">…</emphasis>            — логическое ударение\n"
+    "  <say-as interpret-as=\"digits|date|time|currency|cardinal|ordinal\">…</say-as>\n"
+    "                                                              — как читать число/дату/время\n"
+    "  <sub alias=\"расшифровка\">сокращение</sub>                — замена при озвучке\n"
+    "Вне тегов экранируй спецсимволы: & → &amp;, < → &lt;, > → &gt;. "
+    "Используй SSML экономно — только когда пауза или акцент реально нужны "
+    "для естественного звучания. Если сомневаешься — пиши обычным текстом, "
+    "он тоже корректно озвучится.]"
+)
+
+
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
     """Return True when an interrupt message is internal control flow."""
     if not message:
@@ -4525,6 +4551,33 @@ class GatewayRunner:
                     context_prompt += f"\n\n{vc_context}"
 
         # -----------------------------------------------------------------
+        # SSML instruction — inject only when the agent's reply is likely to
+        # be spoken AND the SSML feature is enabled AND the active TTS
+        # provider is sber_salute (others would read tags literally).
+        # -----------------------------------------------------------------
+        try:
+            from tools.tts_tool import _ssml_feature_enabled
+            voice_mode = self._voice_mode.get(
+                self._voice_key(source.platform, source.chat_id), "off"
+            )
+            is_voice_input = (event.message_type == MessageType.VOICE)
+            voice_reply_likely = (
+                voice_mode == "all"
+                or (voice_mode == "voice_only" and is_voice_input)
+            )
+            if voice_reply_likely and _ssml_feature_enabled():
+                tts_provider = (
+                    (user_config.get("tts") or {}).get("provider") or ""
+                ).strip().lower()
+                if tts_provider == "sber_salute":
+                    context_prompt = (
+                        (context_prompt or "") + f"\n\n{_VOICE_SSML_PROMPT}"
+                    )
+        except Exception:
+            # Never let prompt augmentation break the main reply path.
+            logger.debug("SSML prompt injection skipped", exc_info=True)
+
+        # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
         #
         # If the user attached image(s), we run the vision tool eagerly so
@@ -4841,10 +4894,19 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
-            # Auto voice reply: send TTS audio before the text response
+            # Auto voice reply: send TTS audio before the text response.
+            # The voice path receives the raw response (with SSML); the text
+            # path below gets a cleaned copy so the chat bubble doesn't show
+            # XML tags to the user.
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
+            try:
+                from tools.tts_tool import _contains_ssml, _strip_ssml
+                if _contains_ssml(response):
+                    response = _strip_ssml(response)
+            except Exception:
+                logger.debug("SSML strip for text channel skipped", exc_info=True)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
