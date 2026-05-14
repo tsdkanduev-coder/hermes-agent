@@ -193,6 +193,44 @@ class TestSberSaluteSsmlPath:
         assert sent_body.startswith("<speak>") and sent_body.endswith("</speak>")
         assert synth_call.kwargs["headers"]["Content-Type"] == "application/ssml"
 
+    def test_auto_content_type_allows_ssml_when_enabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SBER_SALUTE_AUTH_KEY", "abc==")
+        monkeypatch.setenv("HERMES_TTS_SSML_ENABLED", "1")
+        out = str(tmp_path / "out.ogg")
+        body = 'Привет <break time="500ms"/>мир'
+
+        with patch("requests.post") as mock_post:
+            mock_post.side_effect = [_ok_token_response(), _ok_audio_response()]
+            from tools.tts_tool import _generate_sber_salute_tts
+            _generate_sber_salute_tts(
+                body,
+                out,
+                {"sber_salute": {"content_type": "auto"}},
+            )
+
+        synth_call = mock_post.call_args_list[1]
+        assert synth_call.kwargs["headers"]["Content-Type"] == "application/ssml"
+
+    def test_explicit_text_content_type_still_overrides_ssml(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SBER_SALUTE_AUTH_KEY", "abc==")
+        monkeypatch.setenv("HERMES_TTS_SSML_ENABLED", "1")
+        out = str(tmp_path / "out.ogg")
+        body = 'Привет <break time="500ms"/>мир'
+
+        with patch("requests.post") as mock_post:
+            mock_post.side_effect = [_ok_token_response(), _ok_audio_response()]
+            from tools.tts_tool import _generate_sber_salute_tts
+            _generate_sber_salute_tts(
+                body,
+                out,
+                {"sber_salute": {"content_type": "application/text"}},
+            )
+
+        synth_call = mock_post.call_args_list[1]
+        sent_body = synth_call.kwargs["data"].decode("utf-8")
+        assert sent_body.startswith("<speak>")
+        assert synth_call.kwargs["headers"]["Content-Type"] == "application/text"
+
     def test_ssml_disabled_keeps_raw_text(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SBER_SALUTE_AUTH_KEY", "abc==")
         out = str(tmp_path / "out.ogg")

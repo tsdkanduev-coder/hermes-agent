@@ -607,6 +607,8 @@ def _generate_sber_salute_tts(text: str, output_path: str, tts_config: Dict[str,
         os.getenv("SBER_SALUTE_TTS_CONTENT_TYPE", "").strip()
         or str(cfg.get("content_type") or "").strip()
     )
+    if explicit_content_type.lower() in {"auto", "application/auto"}:
+        explicit_content_type = ""
     if explicit_content_type:
         content_type = explicit_content_type
     elif text.lstrip().startswith("<speak"):

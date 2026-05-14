@@ -652,7 +652,7 @@ DEFAULT_CONFIG = {
         "sber_salute": {
             "voice": "Nec_24000",
             "format": "opus",
-            "content_type": "application/text",
+            "content_type": "auto",
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
